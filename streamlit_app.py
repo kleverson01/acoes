@@ -30,6 +30,7 @@ from daytrade_smc import (
     DAYTRADE_CONTEXT_TIMEFRAMES,
     DEFAULT_SYMBOLS,
     Direction,
+    MODALITIES,
     Signal,
     SWING_CONFIRMATION_TIMEFRAMES,
     SWING_CONTEXT_TIMEFRAMES,
@@ -67,10 +68,10 @@ DIRECTION_COLOR = {
 # Dados / cache / análise
 # ========================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...]):
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
     """Cacheia o pacote de timeframes por 60s — evita rebuscar no Yahoo a cada rerun do Streamlit."""
     counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts)
+    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality)
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
@@ -272,8 +273,8 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
         )
         return
 
-    dir_a = next(s for s in result_a.signals if s.name == "Confluência").direction
-    dir_b = next(s for s in result_b.signals if s.name == "Confluência").direction
+    dir_a = next(s.direction for s in result_a.signals if s.name == mtf.modality)
+    dir_b = next(s.direction for s in result_b.signals if s.name == mtf.modality)
 
     if mtf.confirmed:
         color = DIRECTION_COLOR[mtf.confirmed_direction]
@@ -281,7 +282,7 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
             f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
             f'background:{color}18; margin-bottom:14px;">'
             f'✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
-            f"{tf_a} e {tf_b} concordam na mesma direção."
+            f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>."
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -289,8 +290,8 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
         st.markdown(
             f'<div style="border:1px solid #8291a1; border-radius:8px; padding:12px 16px; '
             f'background:#8291a118; margin-bottom:14px;">'
-            f"❌ <b>NÃO CONFIRMADO</b> — {tf_a} diz <b>{dir_a.value}</b>, {tf_b} diz <b>{dir_b.value}</b>. "
-            f"Só é recomendação operável quando os dois concordam."
+            f"❌ <b>NÃO CONFIRMADO</b> (leitura: <b>{mtf.modality}</b>) — {tf_a} diz <b>{dir_a.value}</b>, "
+            f"{tf_b} diz <b>{dir_b.value}</b>. Só é recomendação operável quando os dois concordam."
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -306,7 +307,7 @@ OUTCOME_LABELS = {
 }
 
 
-def render_retro_check(symbol: str, style: str, count: int) -> None:
+def render_retro_check(symbol: str, style: str, modality: str, count: int) -> None:
     st.caption(
         "Roda a análise usando SÓ os dados que existiam até a data escolhida (sem espiar o "
         "futuro), depois confere o que aconteceu de verdade nos candles seguintes — se bateu "
@@ -324,16 +325,16 @@ def render_retro_check(symbol: str, style: str, count: int) -> None:
     if st.button("🔍 Verificar", type="primary"):
         as_of_ts = pd.Timestamp(as_of_date).tz_localize("America/Sao_Paulo") + pd.Timedelta(hours=23, minutes=59)
         try:
-            check = check_signal_as_of(symbol, check_tf, as_of_ts, count=count)
+            check = check_signal_as_of(symbol, check_tf, as_of_ts, count=count, modality=modality)
         except Exception as exc:
             st.error(f"Não foi possível verificar: {exc}")
             return
 
-        st.markdown(f"**{symbol}** em **{TIMEFRAME_LABELS[check_tf]}**, com dados até "
+        st.markdown(f"**{symbol}** em **{TIMEFRAME_LABELS[check_tf]}** (leitura: **{modality}**), com dados até "
                    f"**{check.as_of.strftime('%d/%m/%Y %H:%M')}**")
 
         if check.direction == Direction.NEUTRAL or check.risk.entry is None:
-            st.info("Não havia sinal operável nesta data (Confluência estava NEUTRO).")
+            st.info(f"Não havia sinal operável nesta data ({modality} estava NEUTRO).")
             return
 
         color = DIRECTION_COLOR[check.direction]
@@ -357,13 +358,13 @@ def render_retro_check(symbol: str, style: str, count: int) -> None:
             st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
 
 
-def render_individual_analysis(symbol: str, style: str, count: int, risk_budget: float | None) -> None:
+def render_individual_analysis(symbol: str, style: str, modality: str, count: int, risk_budget: float | None) -> None:
     confirmation = STYLES[style]["confirmation"]
     context_tfs = STYLES[style]["context"]
     all_tfs = list(confirmation) + [tf for tf in context_tfs if tf not in confirmation]
 
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol}..."):
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality)
 
     render_confirmation_badge(mtf, confirmation)
 
@@ -419,23 +420,23 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
 # fixo por intervalo, nunca criado dinamicamente.
 # ========================================================================
 @st.fragment(run_every=30)
-def _auto_refresh_30(symbol, style, count, risk_budget):
-    render_individual_analysis(symbol, style, count, risk_budget)
+def _auto_refresh_30(symbol, style, modality, count, risk_budget):
+    render_individual_analysis(symbol, style, modality, count, risk_budget)
 
 
 @st.fragment(run_every=60)
-def _auto_refresh_60(symbol, style, count, risk_budget):
-    render_individual_analysis(symbol, style, count, risk_budget)
+def _auto_refresh_60(symbol, style, modality, count, risk_budget):
+    render_individual_analysis(symbol, style, modality, count, risk_budget)
 
 
 @st.fragment(run_every=120)
-def _auto_refresh_120(symbol, style, count, risk_budget):
-    render_individual_analysis(symbol, style, count, risk_budget)
+def _auto_refresh_120(symbol, style, modality, count, risk_budget):
+    render_individual_analysis(symbol, style, modality, count, risk_budget)
 
 
 @st.fragment(run_every=300)
-def _auto_refresh_300(symbol, style, count, risk_budget):
-    render_individual_analysis(symbol, style, count, risk_budget)
+def _auto_refresh_300(symbol, style, modality, count, risk_budget):
+    render_individual_analysis(symbol, style, modality, count, risk_budget)
 
 
 _AUTO_REFRESH_FRAGMENTS = {
@@ -446,7 +447,7 @@ _AUTO_REFRESH_FRAGMENTS = {
 }
 
 
-def run_scanner(symbols: list[str], style: str, count: int, risk_budget: float | None) -> pd.DataFrame:
+def run_scanner(symbols: list[str], style: str, modality: str, count: int, risk_budget: float | None) -> pd.DataFrame:
     rows = []
     progress = st.progress(0.0, text="Iniciando scanner...")
     confirmation = STYLES[style]["confirmation"]
@@ -456,7 +457,7 @@ def run_scanner(symbols: list[str], style: str, count: int, risk_budget: float |
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
@@ -468,8 +469,8 @@ def run_scanner(symbols: list[str], style: str, count: int, risk_budget: float |
             time.sleep(0.3)
             continue
 
-        conf_a = next(s for s in result_a.signals if s.name == "Confluência")
-        conf_b = next(s for s in result_b.signals if s.name == "Confluência")
+        conf_a = next(s for s in result_a.signals if s.name == modality)
+        conf_b = next(s for s in result_b.signals if s.name == modality)
 
         direction_label = mtf.confirmed_direction.value if mtf.confirmed else "NEUTRO"
         risk = conf_a.risk if mtf.confirmed else None
@@ -551,6 +552,15 @@ with st.sidebar:
     )
     conf_a, conf_b = STYLES[style]["confirmation"]
 
+    st.markdown("### Modalidade")
+    modality = st.selectbox(
+        "Qual leitura usar como base da recomendação", MODALITIES, key="modality_select",
+        help="Confluência combina as 4 categorias. As outras (SMC, Price Action, Médias Móveis, "
+             "VWAP) usam só a leitura isolada daquela categoria, com stop/alvo calculados só a "
+             "partir dela — a mesma lógica das abas na Análise Individual, só que agora também "
+             "decide a confirmação multi-timeframe e o Scanner.",
+    )
+
     st.markdown("### Ativos monitorados")
     new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
     if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
@@ -610,16 +620,16 @@ if mode == "Análise individual":
 
     if auto_refresh:
         st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, count, risk_budget)
+        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, count, risk_budget)
     else:
-        render_individual_analysis(symbol, style, count, risk_budget)
+        render_individual_analysis(symbol, style, modality, count, risk_budget)
 
 elif mode == "Scanner (todos os ativos)":
-    st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · {count} candles · "
-              f"recomendação exige {conf_a}+{conf_b} concordando")
+    st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
+              f"{count} candles · recomendação exige {conf_a}+{conf_b} concordando")
 
     if run_scanner_clicked:
-        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, count, risk_budget)
+        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, count, risk_budget)
         st.session_state.scanner_risk_budget = risk_budget
 
     if "scanner_result" in st.session_state:
@@ -651,4 +661,4 @@ elif mode == "Scanner (todos os ativos)":
 
 else:  # Verificação retroativa
     symbol = st.session_state.symbol_select
-    render_retro_check(symbol, style, count)
+    render_retro_check(symbol, style, modality, count)

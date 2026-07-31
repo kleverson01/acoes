@@ -1317,15 +1317,19 @@ class TimeframeResult:
 @dataclass
 class MultiTimeframeResult:
     symbol: str
-    results: dict[str, TimeframeResult]  # chaves: "M15", "H1", "H4", "D1"
-    confirmed: bool               # True só se M15 e H1 concordarem na mesma direção (não-NEUTRO)
+    results: dict[str, TimeframeResult]  # chaves: "M15", "H1", "H4", "D1", "W1"
+    modality: str                  # qual leitura foi usada pra confirmação: Confluência, SMC, Price Action, Médias Móveis ou VWAP
+    confirmed: bool               # True só se os dois timeframes de confirmação concordarem na mesma direção (nessa leitura)
     confirmed_direction: Direction
 
 
-def _confluence_direction(signals: list[Signal] | None) -> Direction | None:
+MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP")
+
+
+def _signal_direction(signals: list[Signal] | None, modality: str = "Confluência") -> Direction | None:
     if not signals:
         return None
-    return next(s.direction for s in signals if s.name == "Confluência")
+    return next((s.direction for s in signals if s.name == modality), None)
 
 
 DEFAULT_TF_COUNTS = {"M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 150}
@@ -1382,12 +1386,16 @@ def check_signal_as_of(
     timeframe: str,
     as_of: pd.Timestamp,
     count: int = 250,
+    modality: str = "Confluência",
 ) -> RetroSignalCheck:
     """
     Busca os dados normalmente (que vêm até "agora"), separa em duas
     partes: o que já era conhecido ATÉ `as_of` (usado pra gerar o
     sinal, sem espiar o futuro) e o que veio DEPOIS (usado só pra
     conferir o resultado, nunca pra gerar o sinal).
+
+    `modality` escolhe qual das 5 leituras é avaliada: "Confluência"
+    (padrão), "SMC", "Price Action", "Médias Móveis" ou "VWAP".
     """
     as_of_utc = as_of.tz_localize(LOCAL_TZ) if as_of.tzinfo is None else as_of
     as_of_utc = as_of_utc.tz_convert("UTC")
@@ -1403,10 +1411,10 @@ def check_signal_as_of(
         )
 
     context, signals = analyze(historical)
-    confluence = next(s for s in signals if s.name == "Confluência")
+    chosen = next(s for s in signals if s.name == modality)
 
-    outcome, detail, candles_to_result = evaluate_signal_outcome(confluence.risk, confluence.direction, future)
-    if confluence.direction == Direction.NEUTRAL or confluence.risk.entry is None:
+    outcome, detail, candles_to_result = evaluate_signal_outcome(chosen.risk, chosen.direction, future)
+    if chosen.direction == Direction.NEUTRAL or chosen.risk.entry is None:
         outcome, detail, candles_to_result = "SEM_SINAL", "Não havia sinal operável nesta data.", None
     elif future.empty:
         outcome, detail, candles_to_result = "SEM_DADO_FUTURO", "Não há candles disponíveis depois desta data ainda.", None
@@ -1414,10 +1422,10 @@ def check_signal_as_of(
     return RetroSignalCheck(
         timeframe=timeframe,
         as_of=historical.index[-1].tz_convert(LOCAL_TZ),
-        direction=confluence.direction,
-        setup=confluence.setup,
-        score=confluence.score,
-        risk=confluence.risk,
+        direction=chosen.direction,
+        setup=chosen.setup,
+        score=chosen.score,
+        risk=chosen.risk,
         outcome=outcome,
         outcome_detail=detail,
         candles_ate_resultado=candles_to_result,
@@ -1430,6 +1438,7 @@ def analyze_symbol_mtf(
     confirmation: tuple[str, str] = CONFIRMATION_TIMEFRAMES,
     context: tuple[str, ...] = CONTEXT_TIMEFRAMES,
     counts: dict[str, int] | None = None,
+    modality: str = "Confluência",
 ) -> MultiTimeframeResult:
     """
     Roda a análise nos timeframes de CONFIRMAÇÃO (obrigatórios — a
@@ -1437,9 +1446,11 @@ def analyze_symbol_mtf(
     mesma direção) e de CONTEXTO (informativos, não bloqueiam nem
     confirmam nada sozinhos).
 
-    Serve tanto pra Day Trade (confirmação M15+H1, contexto H4+D1)
-    quanto pra Swing Trade (confirmação D1+W1, contexto H4) — e
-    qualquer outra combinação, se um dia fizer sentido adicionar.
+    `modality` escolhe QUAL das 5 leituras decide a confirmação:
+    "Confluência" (padrão, combina tudo), "SMC", "Price Action",
+    "Médias Móveis" ou "VWAP". Serve tanto pra Day Trade (confirmação
+    M15+H1, contexto H4+D1) quanto pra Swing Trade (confirmação D1+W1,
+    contexto H4) — e qualquer combinação de timeframes/modalidade.
 
     H4, quando pedido (confirmação ou contexto), é sempre construído a
     partir do H1 já baixado — se H1 não estiver entre os timeframes
@@ -1489,13 +1500,16 @@ def analyze_symbol_mtf(
         results.pop("H1", None)  # H1 só foi buscado como dependência do H4, não foi pedido de verdade
 
     tf_a, tf_b = confirmation
-    dir_a = _confluence_direction(results[tf_a].signals) if tf_a in results else None
-    dir_b = _confluence_direction(results[tf_b].signals) if tf_b in results else None
+    dir_a = _signal_direction(results[tf_a].signals, modality) if tf_a in results else None
+    dir_b = _signal_direction(results[tf_b].signals, modality) if tf_b in results else None
 
     confirmed = bool(dir_a and dir_b and dir_a == dir_b and dir_a != Direction.NEUTRAL)
     confirmed_direction = dir_a if confirmed and dir_a is not None else Direction.NEUTRAL
 
-    return MultiTimeframeResult(symbol=symbol, results=results, confirmed=confirmed, confirmed_direction=confirmed_direction)
+    return MultiTimeframeResult(
+        symbol=symbol, results=results, modality=modality,
+        confirmed=confirmed, confirmed_direction=confirmed_direction,
+    )
 
 
 def percentage(entry: float, price: float) -> float:

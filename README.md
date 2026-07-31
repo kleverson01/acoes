@@ -60,6 +60,17 @@ streamlit run streamlit_app.py
 
 ---
 
+## Filtro de modalidade — qual leitura decide a recomendação
+
+Novo seletor **Modalidade** na barra lateral, abaixo do Estilo de operação: **Confluência** (padrão, combina as 4 categorias), **SMC**, **Price Action**, **Médias Móveis** ou **VWAP**.
+
+A modalidade escolhida decide:
+- Qual leitura precisa concordar entre os dois timeframes de confirmação (o selo ✅/❌)
+- Qual leitura aparece nas colunas de score/entrada/stop/alvo do Scanner
+- Qual leitura é avaliada na Verificação retroativa
+
+Continua dando pra ver as 5 leituras lado a lado dentro de cada aba de timeframe na Análise Individual — a Modalidade só decide qual delas "manda" na confirmação e no Scanner, não esconde as outras.
+
 ## Verificação retroativa — "esse sinal teria dado certo?"
 
 Terceiro modo na barra lateral, ao lado de Análise Individual e Scanner. Escolha um ativo, um timeframe e uma data no passado — o app roda a análise usando **só os dados que existiam até aquele fechamento** (sem espiar o futuro), e depois confere o que aconteceu de verdade nos candles seguintes: bateu o Alvo 1, o Alvo 2, o Stop, ou ainda está em aberto.
