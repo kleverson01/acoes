@@ -26,16 +26,33 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from daytrade_smc import (
-    CONFIRMATION_TIMEFRAMES,
+    DAYTRADE_CONFIRMATION_TIMEFRAMES,
+    DAYTRADE_CONTEXT_TIMEFRAMES,
     DEFAULT_SYMBOLS,
     Direction,
     Signal,
+    SWING_CONFIRMATION_TIMEFRAMES,
+    SWING_CONTEXT_TIMEFRAMES,
     analyze_symbol_mtf,
+    check_signal_as_of,
     load_symbols,
     quality,
     save_symbols,
     yahoo_symbol,
 )
+
+STYLES = {
+    "Day Trade": {
+        "confirmation": DAYTRADE_CONFIRMATION_TIMEFRAMES,
+        "context": DAYTRADE_CONTEXT_TIMEFRAMES,
+        "count_label": "Candles fechados (M15 e H1)",
+    },
+    "Swing Trade": {
+        "confirmation": SWING_CONFIRMATION_TIMEFRAMES,
+        "context": SWING_CONTEXT_TIMEFRAMES,
+        "count_label": "Candles fechados (Diário e Semanal)",
+    },
+}
 
 st.set_page_config(page_title="Day Trade SMC", page_icon="📊", layout="wide")
 
@@ -50,9 +67,10 @@ DIRECTION_COLOR = {
 # Dados / cache / análise
 # ========================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_mtf(symbol: str, count: int):
-    """Cacheia o pacote inteiro (M15+H1+H4+D1) por 60s — evita rebuscar no Yahoo a cada rerun do Streamlit."""
-    return analyze_symbol_mtf(symbol, m15_count=count, h1_count=count)
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...]):
+    """Cacheia o pacote de timeframes por 60s — evita rebuscar no Yahoo a cada rerun do Streamlit."""
+    counts = {tf: count for tf in (*confirmation, *context)}
+    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts)
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
@@ -236,13 +254,14 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) 
 TIMEFRAME_LABELS = {
     "M15": "15 minutos",
     "H1": "60 minutos",
-    "H4": "240 minutos (contexto)",
-    "D1": "Diário (contexto)",
+    "H4": "240 minutos",
+    "D1": "Diário",
+    "W1": "Semanal",
 }
 
 
-def render_confirmation_badge(mtf) -> None:
-    tf_a, tf_b = CONFIRMATION_TIMEFRAMES
+def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
+    tf_a, tf_b = confirmation
     result_a = mtf.results[tf_a]
     result_b = mtf.results[tf_b]
 
@@ -277,14 +296,79 @@ def render_confirmation_badge(mtf) -> None:
         )
 
 
-def render_individual_analysis(symbol: str, count: int, risk_budget: float | None) -> None:
-    with st.spinner(f"Buscando M15, H1, H4 e Diário de {symbol}..."):
-        mtf = cached_mtf(symbol, count)
+OUTCOME_LABELS = {
+    "ALVO_1": ("✅ Bateu o Alvo 1", "#2ed3a3"),
+    "ALVO_2": ("✅ Bateu o Alvo 2", "#2ed3a3"),
+    "STOP": ("❌ Bateu o Stop", "#ff5470"),
+    "EM_ABERTO": ("⏳ Ainda em aberto", "#f0b429"),
+    "SEM_SINAL": ("— Sem sinal operável nesta data", "#8291a1"),
+    "SEM_DADO_FUTURO": ("⏳ Sem candles seguintes disponíveis ainda", "#8291a1"),
+}
 
-    render_confirmation_badge(mtf)
 
-    tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] for tf in ("M15", "H1", "H4", "D1")])
-    for tab, tf in zip(tf_tabs, ("M15", "H1", "H4", "D1")):
+def render_retro_check(symbol: str, style: str, count: int) -> None:
+    st.caption(
+        "Roda a análise usando SÓ os dados que existiam até a data escolhida (sem espiar o "
+        "futuro), depois confere o que aconteceu de verdade nos candles seguintes — se bateu "
+        "entrada, alvo ou stop."
+    )
+
+    all_tfs = list(dict.fromkeys([*STYLES[style]["confirmation"], *STYLES[style]["context"]]))
+    col1, col2 = st.columns(2)
+    with col1:
+        check_tf = st.selectbox("Timeframe a verificar", all_tfs, format_func=lambda tf: TIMEFRAME_LABELS[tf])
+    with col2:
+        default_date = pd.Timestamp.now(tz="America/Sao_Paulo").date() - pd.Timedelta(days=1)
+        as_of_date = st.date_input("Data (fechamento até esse dia)", value=default_date)
+
+    if st.button("🔍 Verificar", type="primary"):
+        as_of_ts = pd.Timestamp(as_of_date).tz_localize("America/Sao_Paulo") + pd.Timedelta(hours=23, minutes=59)
+        try:
+            check = check_signal_as_of(symbol, check_tf, as_of_ts, count=count)
+        except Exception as exc:
+            st.error(f"Não foi possível verificar: {exc}")
+            return
+
+        st.markdown(f"**{symbol}** em **{TIMEFRAME_LABELS[check_tf]}**, com dados até "
+                   f"**{check.as_of.strftime('%d/%m/%Y %H:%M')}**")
+
+        if check.direction == Direction.NEUTRAL or check.risk.entry is None:
+            st.info("Não havia sinal operável nesta data (Confluência estava NEUTRO).")
+            return
+
+        color = DIRECTION_COLOR[check.direction]
+        action = "COMPRAR" if check.direction == Direction.BUY else "VENDER"
+        st.markdown(
+            f'> **{action} {symbol}** perto de **R$ {check.risk.entry:.2f}**, stop em '
+            f'**R$ {check.risk.stop:.2f}**, alvo em **R$ {check.risk.target_1:.2f}** '
+            f'(setup: {check.setup}, score {check.score:.1f}/100)'
+        )
+
+        outcome_label, outcome_color = OUTCOME_LABELS[check.outcome]
+        st.markdown(
+            f'<div style="border:1px solid {outcome_color}; border-radius:8px; padding:12px 16px; '
+            f'background:{outcome_color}18; margin:10px 0;">'
+            f'<b style="color:{outcome_color}">{outcome_label}</b><br>{check.outcome_detail}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        if check.outcome in ("EM_ABERTO", "STOP", "ALVO_1", "ALVO_2"):
+            st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
+
+
+def render_individual_analysis(symbol: str, style: str, count: int, risk_budget: float | None) -> None:
+    confirmation = STYLES[style]["confirmation"]
+    context_tfs = STYLES[style]["context"]
+    all_tfs = list(confirmation) + [tf for tf in context_tfs if tf not in confirmation]
+
+    with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol}..."):
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs)
+
+    render_confirmation_badge(mtf, confirmation)
+
+    tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] + (" (contexto)" if tf not in confirmation else "") for tf in all_tfs])
+    for tab, tf in zip(tf_tabs, all_tfs):
         with tab:
             result = mtf.results[tf]
             if result.error:
@@ -305,7 +389,7 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
         "Ver entrada/stop/alvo de qual leitura no gráfico:",
         [s.name for s in signals], index=0, key=f"chart_choice_{timeframe}",
     )
-    st.plotly_chart(build_chart(context, by_name[chart_choice], symbol), use_container_width=True, key=f"chart_{timeframe}")
+    st.plotly_chart(build_chart(context, by_name[chart_choice], symbol), use_container_width=True, key=f"chart_{timeframe}_{chart_choice}")
 
     tabs = st.tabs([s.name for s in signals])
     for tab, s in zip(tabs, signals):
@@ -335,23 +419,23 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
 # fixo por intervalo, nunca criado dinamicamente.
 # ========================================================================
 @st.fragment(run_every=30)
-def _auto_refresh_30(symbol, count, risk_budget):
-    render_individual_analysis(symbol, count, risk_budget)
+def _auto_refresh_30(symbol, style, count, risk_budget):
+    render_individual_analysis(symbol, style, count, risk_budget)
 
 
 @st.fragment(run_every=60)
-def _auto_refresh_60(symbol, count, risk_budget):
-    render_individual_analysis(symbol, count, risk_budget)
+def _auto_refresh_60(symbol, style, count, risk_budget):
+    render_individual_analysis(symbol, style, count, risk_budget)
 
 
 @st.fragment(run_every=120)
-def _auto_refresh_120(symbol, count, risk_budget):
-    render_individual_analysis(symbol, count, risk_budget)
+def _auto_refresh_120(symbol, style, count, risk_budget):
+    render_individual_analysis(symbol, style, count, risk_budget)
 
 
 @st.fragment(run_every=300)
-def _auto_refresh_300(symbol, count, risk_budget):
-    render_individual_analysis(symbol, count, risk_budget)
+def _auto_refresh_300(symbol, style, count, risk_budget):
+    render_individual_analysis(symbol, style, count, risk_budget)
 
 
 _AUTO_REFRESH_FRAGMENTS = {
@@ -362,21 +446,24 @@ _AUTO_REFRESH_FRAGMENTS = {
 }
 
 
-def run_scanner(symbols: list[str], count: int, risk_budget: float | None) -> pd.DataFrame:
+def run_scanner(symbols: list[str], style: str, count: int, risk_budget: float | None) -> pd.DataFrame:
     rows = []
     progress = st.progress(0.0, text="Iniciando scanner...")
-    tf_a, tf_b = CONFIRMATION_TIMEFRAMES
+    confirmation = STYLES[style]["confirmation"]
+    context_tfs = STYLES[style]["context"]
+    tf_a, tf_b = confirmation
+    col_a, col_b = f"Score {tf_a}", f"Score {tf_b}"
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
         if result_a.error or result_b.error:
             err = (result_a.error or result_b.error or "")[:60]
-            rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Direção": "ERRO", "Score M15": None,
-                        "Score H1": None, "Setup": err, "Entrada": None, "Stop": None, "Alvo 1": None,
+            rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Direção": "ERRO", col_a: None,
+                        col_b: None, "Setup": err, "Entrada": None, "Stop": None, "Alvo 1": None,
                         "Quantidade": None, "Total (R$)": None})
             time.sleep(0.3)
             continue
@@ -399,9 +486,9 @@ def run_scanner(symbols: list[str], count: int, risk_budget: float | None) -> pd
             "Ativo": symbol,
             "Confirmado": "✅" if mtf.confirmed else "❌",
             "Direção": direction_label,
-            "Score M15": round(conf_a.score, 1),
-            "Score H1": round(conf_b.score, 1),
-            "Setup": conf_a.setup if mtf.confirmed else f"M15={conf_a.direction.value} / H1={conf_b.direction.value}",
+            col_a: round(conf_a.score, 1),
+            col_b: round(conf_b.score, 1),
+            "Setup": conf_a.setup if mtf.confirmed else f"{tf_a}={conf_a.direction.value} / {tf_b}={conf_b.direction.value}",
             "Entrada": round(risk.entry, 2) if risk and risk.entry else None,
             "Stop": round(risk.stop, 2) if risk and risk.stop else None,
             "Alvo 1": round(risk.target_1, 2) if risk and risk.target_1 else None,
@@ -412,8 +499,8 @@ def run_scanner(symbols: list[str], count: int, risk_budget: float | None) -> pd
 
     progress.empty()
     result = pd.DataFrame(rows)
-    if "Score M15" in result.columns:
-        result = result.sort_values(["Confirmado", "Score M15"], ascending=[True, False], na_position="last")
+    if col_a in result.columns:
+        result = result.sort_values(["Confirmado", col_a], ascending=[True, False], na_position="last")
     return result.reset_index(drop=True)
 
 
@@ -454,7 +541,15 @@ with st.sidebar:
     st.markdown("## 📊 Day Trade SMC")
     st.caption("SMC · Price Action · Médias Móveis · VWAP")
 
-    mode = st.radio("Modo", ["Análise individual", "Scanner (todos os ativos)"], key="mode_select")
+    mode = st.radio("Modo", ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa"], key="mode_select")
+
+    st.markdown("### Estilo de operação")
+    style = st.radio(
+        "Estilo", list(STYLES.keys()), key="style_select", horizontal=True,
+        help="Day Trade confirma em M15+H1 (posições no mesmo dia). "
+             "Swing Trade confirma em Diário+Semanal (posições de dias a semanas), com H4 como contexto de timing de entrada.",
+    )
+    conf_a, conf_b = STYLES[style]["confirmation"]
 
     st.markdown("### Ativos monitorados")
     new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
@@ -465,7 +560,7 @@ with st.sidebar:
             _persist_watchlist()
         st.rerun()
 
-    if mode == "Análise individual":
+    if mode in ("Análise individual", "Verificação retroativa"):
         st.selectbox("Ativo para análise", st.session_state.watchlist, key="symbol_select")
 
     remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
@@ -480,9 +575,10 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("### Parâmetros")
-    st.caption("A recomendação agora exige M15 **e** H1 concordando (ver \"Filtro multi-timeframe\" no rodapé). "
-              "H4 e Diário aparecem como contexto adicional.")
-    count = st.slider("Candles fechados (M15 e H1)", min_value=50, max_value=400, value=250, step=10)
+    st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "
+              f"(ver \"Filtro multi-timeframe\" no rodapé). "
+              f"{', '.join(TIMEFRAME_LABELS[tf] for tf in STYLES[style]['context'])} aparece como contexto adicional.")
+    count = st.slider(STYLES[style]["count_label"], min_value=50, max_value=400, value=250, step=10)
     risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
     risk_budget = risk_budget if risk_budget > 0 else None
 
@@ -493,7 +589,7 @@ with st.sidebar:
             "Intervalo", options=[30, 60, 120, 300], value=60, format_func=lambda s: f"{s}s",
             disabled=not auto_refresh,
         )
-    else:
+    elif mode == "Scanner (todos os ativos)":
         run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
 
 
@@ -514,16 +610,16 @@ if mode == "Análise individual":
 
     if auto_refresh:
         st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, count, risk_budget)
+        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, count, risk_budget)
     else:
-        render_individual_analysis(symbol, count, risk_budget)
+        render_individual_analysis(symbol, style, count, risk_budget)
 
-else:
-    st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {count} candles (M15/H1) · "
-              f"recomendação exige M15+H1 concordando")
+elif mode == "Scanner (todos os ativos)":
+    st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · {count} candles · "
+              f"recomendação exige {conf_a}+{conf_b} concordando")
 
     if run_scanner_clicked:
-        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, count, risk_budget)
+        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, count, risk_budget)
         st.session_state.scanner_risk_budget = risk_budget
 
     if "scanner_result" in st.session_state:
@@ -552,3 +648,7 @@ else:
             st.rerun()
     else:
         st.info("Clique em **Rodar scanner** na barra lateral para analisar todos os ativos da watchlist.")
+
+else:  # Verificação retroativa
+    symbol = st.session_state.symbol_select
+    render_retro_check(symbol, style, count)

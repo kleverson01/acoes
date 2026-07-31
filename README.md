@@ -60,6 +60,25 @@ streamlit run streamlit_app.py
 
 ---
 
+## Verificação retroativa — "esse sinal teria dado certo?"
+
+Terceiro modo na barra lateral, ao lado de Análise Individual e Scanner. Escolha um ativo, um timeframe e uma data no passado — o app roda a análise usando **só os dados que existiam até aquele fechamento** (sem espiar o futuro), e depois confere o que aconteceu de verdade nos candles seguintes: bateu o Alvo 1, o Alvo 2, o Stop, ou ainda está em aberto.
+
+Isso é diferente do backtest de "rodar em centenas de ativos" — é uma checagem pontual, pra você conferir manualmente um dia específico que te chamou atenção (ex: "o sinal de ontem no fechamento teria dado certo?").
+
+**Limitação real:** como este ambiente de desenvolvimento não tem acesso à internet, essa funcionalidade só pode ser testada de verdade rodando o app publicado (que tem acesso real ao Yahoo Finance). O histórico intraday do Yahoo (M15/H1/H4) cobre só ~60 dias — pra checar datas mais antigas, use Diário ou Semanal.
+
+## Estilo de operação: Day Trade ou Swing Trade
+
+A barra lateral agora tem um seletor **Estilo de operação**, logo abaixo do modo:
+
+| Estilo | Confirmação obrigatória | Contexto |
+|---|---|---|
+| **Day Trade** | M15 + H1 concordando | H4 e Diário |
+| **Swing Trade** | Diário + Semanal concordando | H4 (pra afinar o timing de entrada dentro da tendência maior) |
+
+O motor por trás é o mesmo — SMC, Price Action, Médias, VWAP e Confluência funcionam exatamente igual em qualquer timeframe, e as fórmulas de stop/alvo (ATR, Fibonacci, estrutura, expectativa estatística) já se ajustam sozinhas à escala do timeframe, sem precisar de nenhuma lógica nova pra isso. Trocar de Day Trade pra Swing Trade só muda **quais dois timeframes precisam concordar** e **qual contexto é mostrado** — todo o resto (Scanner, calculadora de posição, painéis de risco) funciona igual nos dois estilos.
+
 ## O que tem agora (além da análise individual)
 
 - **Modo Scanner** — roda a análise em TODOS os ativos da watchlist de uma vez e mostra um ranking por score de confluência, com um botão pra abrir a análise completa de qualquer um deles direto do ranking. É o "Top N" do seu prompt original.

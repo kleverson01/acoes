@@ -103,14 +103,29 @@ TIMEFRAMES = {
         "candles_day": 1,
         "max_days": 730,
     },
+    "W1": {
+        "interval": "1wk",
+        "duration": pd.Timedelta(weeks=1),
+        "candles_day": 1 / 7,
+        "max_days": 2500,  # o Yahoo permite bastante histórico semanal
+    },
 }
 
-# Timeframes exigidos para CONFIRMAR uma recomendação (seção "Filtro
-# multi-timeframe" abaixo): só é considerada válida se M15 e H1
-# concordarem na mesma direção. H4 e D1 entram como contexto adicional,
-# não como exigência de confirmação.
-CONFIRMATION_TIMEFRAMES = ("M15", "H1")
-CONTEXT_TIMEFRAMES = ("H4", "D1")
+# Day Trade: confirmação em M15+H1 (posições fechadas no mesmo dia).
+# H4 e Diário entram como contexto de tendência mais ampla.
+DAYTRADE_CONFIRMATION_TIMEFRAMES = ("M15", "H1")
+DAYTRADE_CONTEXT_TIMEFRAMES = ("H4", "D1")
+
+# Swing Trade: confirmação em Diário+Semanal (posições de dias a semanas).
+# H4 entra como contexto pra afinar o timing de entrada dentro da
+# tendência maior — o inverso do Day Trade, onde H4 é "zoom out".
+SWING_CONFIRMATION_TIMEFRAMES = ("D1", "W1")
+SWING_CONTEXT_TIMEFRAMES = ("H4",)
+
+# Mantidos por compatibilidade — apontam pro conjunto de Day Trade, que
+# é o comportamento padrão histórico deste motor.
+CONFIRMATION_TIMEFRAMES = DAYTRADE_CONFIRMATION_TIMEFRAMES
+CONTEXT_TIMEFRAMES = DAYTRADE_CONTEXT_TIMEFRAMES
 
 
 class Direction(str, Enum):
@@ -1313,63 +1328,172 @@ def _confluence_direction(signals: list[Signal] | None) -> Direction | None:
     return next(s.direction for s in signals if s.name == "Confluência")
 
 
+DEFAULT_TF_COUNTS = {"M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 150}
+
+
+@dataclass
+class RetroSignalCheck:
+    timeframe: str
+    as_of: pd.Timestamp
+    direction: Direction
+    setup: str
+    score: float
+    risk: RiskPlan
+    outcome: str          # "ALVO_1", "ALVO_2", "STOP", "EM_ABERTO", "SEM_SINAL", "SEM_DADO_FUTURO"
+    outcome_detail: str
+    candles_ate_resultado: int | None
+    candles_futuros_disponiveis: int
+
+
+def evaluate_signal_outcome(risk: RiskPlan, direction: Direction, future_df: pd.DataFrame) -> tuple[str, str, int | None]:
+    """
+    Caminha candle a candle pelos dados REAIS que vieram depois do sinal
+    e verifica o que aconteceu primeiro: bateu o stop, o alvo 1, o alvo
+    2, ou nenhum dos dois ainda (em aberto). Quando stop e alvo são
+    tocados no mesmo candle, assume o cenário PIOR (stop primeiro) —
+    mesma convenção conservadora usada em qualquer backtest deste
+    projeto.
+    """
+    if risk.entry is None or risk.stop is None:
+        return "SEM_SINAL", "Não havia sinal operável nesta data.", None
+
+    for i, (_, candle) in enumerate(future_df.iterrows(), start=1):
+        if direction == Direction.BUY:
+            hit_stop = candle["low"] <= risk.stop
+            hit_t1 = risk.target_1 is not None and candle["high"] >= risk.target_1
+            hit_t2 = risk.target_2 is not None and candle["high"] >= risk.target_2
+        else:
+            hit_stop = candle["high"] >= risk.stop
+            hit_t1 = risk.target_1 is not None and candle["low"] <= risk.target_1
+            hit_t2 = risk.target_2 is not None and candle["low"] <= risk.target_2
+
+        if hit_stop:
+            return "STOP", f"Stop batido {i} candle(s) depois, em R$ {risk.stop:.2f}.", i
+        if hit_t2:
+            return "ALVO_2", f"Alvo 2 batido {i} candle(s) depois, em R$ {risk.target_2:.2f}.", i
+        if hit_t1:
+            return "ALVO_1", f"Alvo 1 batido {i} candle(s) depois, em R$ {risk.target_1:.2f}.", i
+
+    return "EM_ABERTO", f"Nenhum nível tocado nos {len(future_df)} candle(s) seguintes disponíveis até agora.", None
+
+
+def check_signal_as_of(
+    symbol: str,
+    timeframe: str,
+    as_of: pd.Timestamp,
+    count: int = 250,
+) -> RetroSignalCheck:
+    """
+    Busca os dados normalmente (que vêm até "agora"), separa em duas
+    partes: o que já era conhecido ATÉ `as_of` (usado pra gerar o
+    sinal, sem espiar o futuro) e o que veio DEPOIS (usado só pra
+    conferir o resultado, nunca pra gerar o sinal).
+    """
+    as_of_utc = as_of.tz_localize(LOCAL_TZ) if as_of.tzinfo is None else as_of
+    as_of_utc = as_of_utc.tz_convert("UTC")
+
+    full_df = fetch_ohlcv(symbol, timeframe, count)
+    historical = full_df[full_df.index <= as_of_utc]
+    future = full_df[full_df.index > as_of_utc]
+
+    if len(historical) < 30:
+        raise ValueError(
+            f"Histórico insuficiente até {as_of.date()} em {timeframe} "
+            f"({len(historical)} candles, precisa de 30+). Tente uma data mais recente ou outro timeframe."
+        )
+
+    context, signals = analyze(historical)
+    confluence = next(s for s in signals if s.name == "Confluência")
+
+    outcome, detail, candles_to_result = evaluate_signal_outcome(confluence.risk, confluence.direction, future)
+    if confluence.direction == Direction.NEUTRAL or confluence.risk.entry is None:
+        outcome, detail, candles_to_result = "SEM_SINAL", "Não havia sinal operável nesta data.", None
+    elif future.empty:
+        outcome, detail, candles_to_result = "SEM_DADO_FUTURO", "Não há candles disponíveis depois desta data ainda.", None
+
+    return RetroSignalCheck(
+        timeframe=timeframe,
+        as_of=historical.index[-1].tz_convert(LOCAL_TZ),
+        direction=confluence.direction,
+        setup=confluence.setup,
+        score=confluence.score,
+        risk=confluence.risk,
+        outcome=outcome,
+        outcome_detail=detail,
+        candles_ate_resultado=candles_to_result,
+        candles_futuros_disponiveis=len(future),
+    )
+
+
 def analyze_symbol_mtf(
     symbol: str,
-    m15_count: int = 250,
-    h1_count: int = 250,
-    d1_count: int = 120,
+    confirmation: tuple[str, str] = CONFIRMATION_TIMEFRAMES,
+    context: tuple[str, ...] = CONTEXT_TIMEFRAMES,
+    counts: dict[str, int] | None = None,
 ) -> MultiTimeframeResult:
     """
-    Roda a análise nos 4 timeframes (M15, H1, H4, D1) de um ativo.
+    Roda a análise nos timeframes de CONFIRMAÇÃO (obrigatórios — a
+    recomendação só é considerada confirmada se os dois concordarem na
+    mesma direção) e de CONTEXTO (informativos, não bloqueiam nem
+    confirmam nada sozinhos).
 
-    A RECOMENDAÇÃO SÓ É CONSIDERADA CONFIRMADA se M15 e H1 concordarem
-    na mesma direção (nem que seja NEUTRO — nesse caso não há
-    confirmação de nenhuma direção). H4 e D1 entram como contexto de
-    tendência mais ampla, mas não bloqueiam a confirmação — servem pra
-    você ver o quadro maior, não pra afinar o timing de entrada.
+    Serve tanto pra Day Trade (confirmação M15+H1, contexto H4+D1)
+    quanto pra Swing Trade (confirmação D1+W1, contexto H4) — e
+    qualquer outra combinação, se um dia fizer sentido adicionar.
 
-    H4 é construído agregando o próprio H1 já baixado (não faz uma
-    segunda chamada ao Yahoo pra isso).
+    H4, quando pedido (confirmação ou contexto), é sempre construído a
+    partir do H1 já baixado — se H1 não estiver entre os timeframes
+    pedidos, ele é buscado só como dependência interna, sem aparecer
+    no resultado final.
     """
-    results: dict[str, TimeframeResult] = {}
+    counts = counts or {}
+    requested = list(dict.fromkeys([*confirmation, *context]))  # únicos, preserva ordem
 
-    for tf, count in [("M15", m15_count), ("H1", h1_count)]:
+    needs_h1_only_for_h4 = "H4" in requested and "H1" not in requested
+    fetch_list = [tf for tf in requested if tf != "H4"]
+    if needs_h1_only_for_h4:
+        fetch_list.insert(0, "H1")
+
+    results: dict[str, TimeframeResult] = {}
+    h1_df: pd.DataFrame | None = None
+
+    for tf in fetch_list:
+        count = counts.get(tf, DEFAULT_TF_COUNTS.get(tf, 200))
         try:
             df = fetch_ohlcv(symbol, tf, count)
-            context, signals = analyze(df)
-            results[tf] = TimeframeResult(tf, context, signals, None)
-        except Exception as exc:  # noqa: BLE001 — mostra qualquer falha ao usuário, não derruba os outros timeframes
+            ctx, signals = analyze(df)
+            results[tf] = TimeframeResult(tf, ctx, signals, None)
+            if tf == "H1":
+                h1_df = ctx.df
+        except Exception as exc:  # noqa: BLE001 — mostra a falha, não derruba os outros timeframes
             results[tf] = TimeframeResult(tf, None, None, str(exc))
 
-    h1_result = results["H1"]
-    if h1_result.context is not None:
-        try:
-            h4_df = _resample_to_h4(h1_result.context.df)
-            if len(h4_df) >= 30:
-                context_h4, signals_h4 = analyze(h4_df)
-                results["H4"] = TimeframeResult("H4", context_h4, signals_h4, None)
-            else:
-                results["H4"] = TimeframeResult(
-                    "H4", None, None,
-                    f"Histórico de H1 insuficiente para montar H4 ({len(h4_df)} candles, precisa de 30+).",
-                )
-        except Exception as exc:  # noqa: BLE001
-            results["H4"] = TimeframeResult("H4", None, None, str(exc))
-    else:
-        results["H4"] = TimeframeResult("H4", None, None, "Depende do H1, que falhou.")
+    if "H4" in requested:
+        if h1_df is not None:
+            try:
+                h4_df = _resample_to_h4(h1_df)
+                if len(h4_df) >= 30:
+                    ctx4, sig4 = analyze(h4_df)
+                    results["H4"] = TimeframeResult("H4", ctx4, sig4, None)
+                else:
+                    results["H4"] = TimeframeResult(
+                        "H4", None, None,
+                        f"Histórico de H1 insuficiente para montar H4 ({len(h4_df)} candles, precisa de 30+).",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                results["H4"] = TimeframeResult("H4", None, None, str(exc))
+        else:
+            results["H4"] = TimeframeResult("H4", None, None, "Depende do H1, que falhou.")
 
-    try:
-        df_d1 = fetch_ohlcv(symbol, "D1", d1_count)
-        context_d1, signals_d1 = analyze(df_d1)
-        results["D1"] = TimeframeResult("D1", context_d1, signals_d1, None)
-    except Exception as exc:  # noqa: BLE001
-        results["D1"] = TimeframeResult("D1", None, None, str(exc))
+    if needs_h1_only_for_h4:
+        results.pop("H1", None)  # H1 só foi buscado como dependência do H4, não foi pedido de verdade
 
-    m15_dir = _confluence_direction(results["M15"].signals)
-    h1_dir = _confluence_direction(results["H1"].signals)
+    tf_a, tf_b = confirmation
+    dir_a = _confluence_direction(results[tf_a].signals) if tf_a in results else None
+    dir_b = _confluence_direction(results[tf_b].signals) if tf_b in results else None
 
-    confirmed = bool(m15_dir and h1_dir and m15_dir == h1_dir and m15_dir != Direction.NEUTRAL)
-    confirmed_direction = m15_dir if confirmed and m15_dir is not None else Direction.NEUTRAL
+    confirmed = bool(dir_a and dir_b and dir_a == dir_b and dir_a != Direction.NEUTRAL)
+    confirmed_direction = dir_a if confirmed and dir_a is not None else Direction.NEUTRAL
 
     return MultiTimeframeResult(symbol=symbol, results=results, confirmed=confirmed, confirmed_direction=confirmed_direction)
 
