@@ -1324,12 +1324,64 @@ class MultiTimeframeResult:
 
 
 MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP")
+ALL_MODALITIES_OPTION = "Todas as modalidades"
+MODALITY_CHOICES = (ALL_MODALITIES_OPTION, *MODALITIES)
+
+
+def overall_score(signals: list[Signal]) -> float:
+    """Score geral: média do score das 5 leituras (Confluência, SMC, Price Action, Médias Móveis, VWAP) neste timeframe."""
+    return sum(s.score for s in signals) / len(signals)
+
+
+def overall_direction(signals: list[Signal]) -> Direction:
+    """
+    Direção geral: exige MAIORIA CLARA entre as 5 leituras (pelo menos
+    3 de 5 apontando pra mesma direção), não só "mais compra que
+    venda" entre poucas leituras não-neutras. Isso evita que 1 leitura
+    isolada decida a direção geral enquanto as outras 4 estão caladas
+    (NEUTRO) — nesse caso o correto é permanecer NEUTRO, não declarar
+    vencedor por W.O.
+    """
+    total = len(signals)
+    if total == 0:
+        return Direction.NEUTRAL
+    buy = sum(1 for s in signals if s.direction == Direction.BUY)
+    sell = sum(1 for s in signals if s.direction == Direction.SELL)
+    minimo = (total // 2) + 1  # maioria absoluta: 3 de 5, 3 de 4, etc.
+    if buy >= minimo and buy > sell:
+        return Direction.BUY
+    if sell >= minimo and sell > buy:
+        return Direction.SELL
+    return Direction.NEUTRAL
+
+
+def overall_agreement(signals: list[Signal]) -> tuple[int, int]:
+    """Quantas das leituras concordam com a direção geral, e o total avaliado — pra exibir tipo '4 de 5 leituras concordam'."""
+    direction = overall_direction(signals)
+    total = len(signals)
+    if direction == Direction.NEUTRAL:
+        buy = sum(1 for s in signals if s.direction == Direction.BUY)
+        sell = sum(1 for s in signals if s.direction == Direction.SELL)
+        return max(buy, sell), total
+    agreeing = sum(1 for s in signals if s.direction == direction)
+    return agreeing, total
 
 
 def _signal_direction(signals: list[Signal] | None, modality: str = "Confluência") -> Direction | None:
     if not signals:
         return None
+    if modality == ALL_MODALITIES_OPTION:
+        return overall_direction(signals)
     return next((s.direction for s in signals if s.name == modality), None)
+
+
+def _signal_score(signals: list[Signal] | None, modality: str = "Confluência") -> float | None:
+    if not signals:
+        return None
+    if modality == ALL_MODALITIES_OPTION:
+        return overall_score(signals)
+    sig = next((s for s in signals if s.name == modality), None)
+    return sig.score if sig else None
 
 
 DEFAULT_TF_COUNTS = {"M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 150}
@@ -1411,7 +1463,19 @@ def check_signal_as_of(
         )
 
     context, signals = analyze(historical)
-    chosen = next(s for s in signals if s.name == modality)
+
+    if modality == ALL_MODALITIES_OPTION:
+        direction = overall_direction(signals)
+        score = overall_score(signals)
+        confluence = next(s for s in signals if s.name == "Confluência")
+        # só usa o plano de risco da Confluência se ela concordar com a
+        # maioria — senão não há um único conjunto de entrada/stop/alvo
+        # coerente pra representar "as 5 leituras", só a votação em si
+        risk = confluence.risk if confluence.direction == direction else RiskPlan()
+        setup = f"Votação das 5 leituras ({confluence.setup} é a leitura combinada)"
+        chosen = Signal("Todas as modalidades", direction, score, score, setup, risk=risk)
+    else:
+        chosen = next(s for s in signals if s.name == modality)
 
     outcome, detail, candles_to_result = evaluate_signal_outcome(chosen.risk, chosen.direction, future)
     if chosen.direction == Direction.NEUTRAL or chosen.risk.entry is None:

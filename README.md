@@ -62,14 +62,14 @@ streamlit run streamlit_app.py
 
 ## Filtro de modalidade — qual leitura decide a recomendação
 
-Novo seletor **Modalidade** na barra lateral, abaixo do Estilo de operação: **Confluência** (padrão, combina as 4 categorias), **SMC**, **Price Action**, **Médias Móveis** ou **VWAP**.
+Seletor **Modalidade** na barra lateral, abaixo do Estilo de operação: **Todas as modalidades** (padrão), **Confluência**, **SMC**, **Price Action**, **Médias Móveis** ou **VWAP**.
 
-A modalidade escolhida decide:
-- Qual leitura precisa concordar entre os dois timeframes de confirmação (o selo ✅/❌)
-- Qual leitura aparece nas colunas de score/entrada/stop/alvo do Scanner
-- Qual leitura é avaliada na Verificação retroativa
+- Escolhendo uma leitura específica, a confirmação e o Scanner usam só aquela leitura (mesmo comportamento anterior).
+- **Escolhendo "Todas as modalidades"**, o sistema calcula um **Score Geral** — a média do score das 5 leituras (Confluência, SMC, Price Action, Médias Móveis, VWAP) — e a **direção geral** por votação majoritária entre elas (empate = NEUTRO). É esse Score Geral que decide a confirmação e ordena o ranking do Scanner. A entrada/stop/alvo mostrados, quando confirmado, ainda vêm do plano de risco da Confluência (só quando ela concorda com a direção geral — senão não há um único plano coerente pra mostrar, só a votação).
 
-Continua dando pra ver as 5 leituras lado a lado dentro de cada aba de timeframe na Análise Individual — a Modalidade só decide qual delas "manda" na confirmação e no Scanner, não esconde as outras.
+## Ranking do Scanner: coluna "Posição" e ordenação por Score Geral
+
+O Scanner agora sempre calcula um **Score Geral** por ativo (média do score nos dois timeframes de confirmação) e ordena por ele — confirmados primeiro, do maior score pro menor. Uma coluna **Posição**, numerada 1, 2, 3... em ordem crescente, mostra o ranking: posição 1 é a melhor colocada.
 
 ## Verificação retroativa — "esse sinal teria dado certo?"
 

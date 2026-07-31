@@ -26,17 +26,21 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from daytrade_smc import (
+    ALL_MODALITIES_OPTION,
     DAYTRADE_CONFIRMATION_TIMEFRAMES,
     DAYTRADE_CONTEXT_TIMEFRAMES,
     DEFAULT_SYMBOLS,
     Direction,
-    MODALITIES,
+    MODALITY_CHOICES,
     Signal,
     SWING_CONFIRMATION_TIMEFRAMES,
     SWING_CONTEXT_TIMEFRAMES,
     analyze_symbol_mtf,
     check_signal_as_of,
     load_symbols,
+    overall_agreement,
+    overall_direction,
+    overall_score,
     quality,
     save_symbols,
     yahoo_symbol,
@@ -206,11 +210,23 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
 # ========================================================================
 def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) -> None:
     color = DIRECTION_COLOR[signal.direction]
+    q = quality(signal.score)
+
+    if q == "OPORTUNIDADE EXCEPCIONAL" and signal.direction != Direction.NEUTRAL:
+        action = "COMPRA" if signal.direction == Direction.BUY else "VENDA"
+        st.markdown(
+            f'<div style="border:2px solid #f0b429; border-radius:8px; padding:10px 16px; '
+            f'background:#f0b42922; margin-bottom:12px; text-align:center;">'
+            f'<span style="font-size:18px;">🌟 <b style="color:#f0b429;">OPORTUNIDADE EXCEPCIONAL</b> · '
+            f'{action} · score {signal.score:.1f}/100</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
     c1, c2, c3 = st.columns([2, 1, 1])
     c1.markdown(f"### {signal.setup}")
     c2.metric("Direção", signal.direction.value)
-    c3.metric("Score", f"{signal.score:.1f}/100", quality(signal.score))
+    c3.metric("Score", f"{signal.score:.1f}/100", q)
 
     risk = signal.risk
     if signal.direction == Direction.NEUTRAL or risk.entry is None:
@@ -273,16 +289,30 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
         )
         return
 
-    dir_a = next(s.direction for s in result_a.signals if s.name == mtf.modality)
-    dir_b = next(s.direction for s in result_b.signals if s.name == mtf.modality)
+    if mtf.modality == ALL_MODALITIES_OPTION:
+        dir_a = overall_direction(result_a.signals)
+        dir_b = overall_direction(result_b.signals)
+        agree_a, total_a = overall_agreement(result_a.signals)
+        agree_b, total_b = overall_agreement(result_b.signals)
+        agreement_note = f" ({tf_a}: {agree_a}/{total_a} leituras concordam · {tf_b}: {agree_b}/{total_b})"
+    else:
+        dir_a = next(s.direction for s in result_a.signals if s.name == mtf.modality)
+        dir_b = next(s.direction for s in result_b.signals if s.name == mtf.modality)
+        agreement_note = ""
 
     if mtf.confirmed:
         color = DIRECTION_COLOR[mtf.confirmed_direction]
+        if mtf.modality == ALL_MODALITIES_OPTION:
+            score_for_badge = overall_score(result_a.signals)
+        else:
+            score_for_badge = next(s.score for s in result_a.signals if s.name == mtf.modality)
+        star = "🌟 " if quality(score_for_badge) == "OPORTUNIDADE EXCEPCIONAL" else ""
         st.markdown(
             f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
             f'background:{color}18; margin-bottom:14px;">'
-            f'✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
+            f'{star}✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
             f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>."
+            f"{agreement_note}"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -339,6 +369,8 @@ def render_retro_check(symbol: str, style: str, modality: str, count: int) -> No
 
         color = DIRECTION_COLOR[check.direction]
         action = "COMPRAR" if check.direction == Direction.BUY else "VENDER"
+        if quality(check.score) == "OPORTUNIDADE EXCEPCIONAL":
+            st.markdown("🌟 **OPORTUNIDADE EXCEPCIONAL** nesta data")
         st.markdown(
             f'> **{action} {symbol}** perto de **R$ {check.risk.entry:.2f}**, stop em '
             f'**R$ {check.risk.stop:.2f}**, alvo em **R$ {check.risk.target_1:.2f}** '
@@ -463,33 +495,51 @@ def run_scanner(symbols: list[str], style: str, modality: str, count: int, risk_
 
         if result_a.error or result_b.error:
             err = (result_a.error or result_b.error or "")[:60]
-            rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Direção": "ERRO", col_a: None,
-                        col_b: None, "Setup": err, "Entrada": None, "Stop": None, "Alvo 1": None,
-                        "Quantidade": None, "Total (R$)": None})
+            rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Destaque": "", "Direção": "ERRO", col_a: None,
+                        col_b: None, "Score Geral": None, "Setup": err, "Entrada": None, "Stop": None,
+                        "Alvo 1": None, "Quantidade": None, "Total (R$)": None})
             time.sleep(0.3)
             continue
 
-        conf_a = next(s for s in result_a.signals if s.name == modality)
-        conf_b = next(s for s in result_b.signals if s.name == modality)
+        if modality == ALL_MODALITIES_OPTION:
+            score_a = round(overall_score(result_a.signals), 1)
+            score_b = round(overall_score(result_b.signals), 1)
+            confluence_a = next(s for s in result_a.signals if s.name == "Confluência")
+            setup_text = (
+                f"Score geral (média de 5 leituras) — {confluence_a.setup}" if mtf.confirmed
+                else f"Score geral (média de 5 leituras) — sem confirmação entre {tf_a}/{tf_b}"
+            )
+            risk = confluence_a.risk if (mtf.confirmed and confluence_a.direction == mtf.confirmed_direction) else None
+        else:
+            conf_a = next(s for s in result_a.signals if s.name == modality)
+            conf_b = next(s for s in result_b.signals if s.name == modality)
+            score_a = round(conf_a.score, 1)
+            score_b = round(conf_b.score, 1)
+            setup_text = conf_a.setup if mtf.confirmed else f"{tf_a}={conf_a.direction.value} / {tf_b}={conf_b.direction.value}"
+            risk = conf_a.risk if mtf.confirmed else None
 
         direction_label = mtf.confirmed_direction.value if mtf.confirmed else "NEUTRO"
-        risk = conf_a.risk if mtf.confirmed else None
 
         qty = None
         total = None
-        if mtf.confirmed and risk_budget and risk.entry is not None and risk.stop is not None:
+        if mtf.confirmed and risk_budget and risk and risk.entry is not None and risk.stop is not None:
             risk_per_share = abs(risk.entry - risk.stop)
             if risk_per_share > 0:
                 qty = int(risk_budget // risk_per_share)
                 total = round(qty * risk.entry, 2) if qty > 0 else 0.0
 
+        score_geral = round((score_a + score_b) / 2, 1)
+        destaque = "🌟 Excepcional" if (mtf.confirmed and quality(score_geral) == "OPORTUNIDADE EXCEPCIONAL") else ""
+
         rows.append({
             "Ativo": symbol,
             "Confirmado": "✅" if mtf.confirmed else "❌",
+            "Destaque": destaque,
             "Direção": direction_label,
-            col_a: round(conf_a.score, 1),
-            col_b: round(conf_b.score, 1),
-            "Setup": conf_a.setup if mtf.confirmed else f"{tf_a}={conf_a.direction.value} / {tf_b}={conf_b.direction.value}",
+            col_a: score_a,
+            col_b: score_b,
+            "Score Geral": score_geral,
+            "Setup": setup_text,
             "Entrada": round(risk.entry, 2) if risk and risk.entry else None,
             "Stop": round(risk.stop, 2) if risk and risk.stop else None,
             "Alvo 1": round(risk.target_1, 2) if risk and risk.target_1 else None,
@@ -500,9 +550,14 @@ def run_scanner(symbols: list[str], style: str, modality: str, count: int, risk_
 
     progress.empty()
     result = pd.DataFrame(rows)
-    if col_a in result.columns:
-        result = result.sort_values(["Confirmado", col_a], ascending=[True, False], na_position="last")
-    return result.reset_index(drop=True)
+    if "Score Geral" in result.columns:
+        # As recomendações são ordenadas pelo Score Geral (média das leituras em ambos os
+        # timeframes de confirmação) — confirmadas primeiro, da maior pontuação pra menor.
+        result = result.sort_values(["Confirmado", "Score Geral"], ascending=[True, False], na_position="last")
+        result = result.reset_index(drop=True)
+        # Posição: 1 = melhor colocado, numeração crescente conforme desce no ranking
+        result.insert(0, "Posição", range(1, len(result) + 1))
+    return result
 
 
 # ========================================================================
@@ -554,11 +609,11 @@ with st.sidebar:
 
     st.markdown("### Modalidade")
     modality = st.selectbox(
-        "Qual leitura usar como base da recomendação", MODALITIES, key="modality_select",
-        help="Confluência combina as 4 categorias. As outras (SMC, Price Action, Médias Móveis, "
-             "VWAP) usam só a leitura isolada daquela categoria, com stop/alvo calculados só a "
-             "partir dela — a mesma lógica das abas na Análise Individual, só que agora também "
-             "decide a confirmação multi-timeframe e o Scanner.",
+        "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
+        help="Confluência combina as 4 categorias. SMC/Price Action/Médias Móveis/VWAP usam só a "
+             "leitura isolada daquela categoria. \"Todas as modalidades\" calcula um SCORE GERAL "
+             "(média das 5 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
+             "e ordenar o Scanner.",
     )
 
     st.markdown("### Ativos monitorados")
