@@ -60,6 +60,106 @@ streamlit run streamlit_app.py
 
 ---
 
+## Atualizar via MT5 sem instalar nada no trabalho (ponte GitHub Actions)
+
+Se você **não pode rodar nada no computador do trabalho**, essa é a opção certa: o app continua publicado no Streamlit Cloud (acessível só pelo navegador, como sempre), e um botão dispara a busca de dado real via MT5 no seu **PC de casa**, sob demanda — não fica atualizando sozinho.
+
+```
+Você clica "Atualizar via MT5" no app (do trabalho, só navegador)
+        │
+        ▼
+App dispara o workflow do GitHub Actions (via API)
+        │
+        ▼
+GitHub aciona o "runner" instalado no seu PC de casa
+        │
+        ▼
+PC de casa (com MT5 aberto) busca os candles reais,
+salva um arquivo e sobe pro GitHub
+        │
+        ▼
+App detecta a atualização e mostra os dados novos
+```
+
+Leva entre 10 e 30 segundos do clique até aparecer o resultado — não é 0 segundos, mas já é bem mais rápido que os 15-20 minutos do Yahoo, e **você não instala nada no trabalho**, só usa o navegador.
+
+### Passo 1 — Criar um token do GitHub (uma vez só)
+
+1. No GitHub: **Settings** (da sua conta, não do repositório) → **Developer settings** → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**.
+2. Dá um nome, escolhe o repositório do projeto, e em **Permissions** marca:
+   - **Actions**: Read and write
+   - **Contents**: Read and write
+3. Gera o token e **copia** (só aparece uma vez).
+
+### Passo 2 — Configurar o token no Streamlit Cloud
+
+1. No painel do seu app no Streamlit Cloud → **Settings** → **Secrets**.
+2. Cola isso, trocando pelos seus dados:
+   ```toml
+   github_repo = "seu-usuario/nome-do-repositorio"
+   github_token = "o-token-que-voce-copiou"
+   ```
+3. Salva — o app reinicia sozinho.
+
+### Passo 3 — Instalar o runner no PC de casa (uma vez só)
+
+1. No GitHub, no repositório → **Settings** → **Actions** → **Runners** → **New self-hosted runner**.
+2. Escolhe **Windows**, e segue exatamente os comandos que o GitHub mostra na tela (baixa um pacote, extrai, roda `config.cmd` com um token temporário que o próprio GitHub gera ali).
+3. No final, ele pergunta se quer rodar como serviço — escolhe **sim** (assim ele fica ativo sempre que o PC ligar, sem precisar abrir nada manualmente).
+4. Confirma que o MetaTrader 5 está instalado e logado nesse mesmo PC, e que as dependências estão instaladas:
+   ```
+   pip install -r requirements.txt
+   pip install -r requirements-local.txt
+   ```
+
+### Passo 4 — Usar
+
+Na barra lateral do app → **Fonte de dados → GitHub (MT5 de casa)** → botão **🔄 Atualizar via MT5 (casa)**. O app mostra a data/hora da última atualização, sempre visível, pra nunca ficar em dúvida se o dado que está vendo é fresco ou antigo.
+
+**O que precisa estar ligado em casa pra funcionar:** o PC ligado, o MetaTrader 5 aberto e logado, e internet funcionando (o runner do GitHub fica esperando em segundo plano, não precisa abrir nada manualmente toda vez).
+
+## MetaTrader 5 direto (rodando local, sem passar pelo GitHub)
+
+*(Se você não pode rodar nada no computador de onde vai acessar — veja a seção "Atualizar via MT5 sem instalar nada no trabalho" logo acima. Esta seção aqui é pra quando você acessa direto do PC que já tem o MT5, sem precisar da ponte via GitHub.)*
+
+Seletor **Fonte de dados** na barra lateral tem 3 opções: **Yahoo Finance** (padrão, ~15-20min de atraso, funciona em qualquer lugar), **MetaTrader 5** (tempo real, direto, mas com uma limitação importante) ou **GitHub (MT5 de casa)** (a ponte descrita acima).
+
+### A limitação do MetaTrader 5 direto
+
+O MT5 não é uma API de internet — é uma DLL que se comunica com o terminal MT5 **aberto na mesma máquina**. Isso significa: **o app não pode usar essa opção rodando no Streamlit Cloud** (servidor Linux, sem MT5 instalado). Pra usar dado real direto, você precisa rodar o app **localmente**, no Windows, na mesma máquina onde o MetaTrader 5 está aberto e logado.
+
+Se você tentar selecionar "MetaTrader 5" enquanto o app está publicado na nuvem, vai aparecer um erro claro explicando isso — não trava o app, só avisa.
+
+### Como rodar localmente com MT5
+
+1. No computador com o MT5 instalado e logado na sua corretora:
+   ```
+   pip install -r requirements.txt
+   pip install -r requirements-local.txt
+   streamlit run streamlit_app.py
+   ```
+2. Abre `http://localhost:8501` no navegador desse mesmo computador — já funciona local.
+3. Na barra lateral, troca **Fonte de dados** pra **MetaTrader 5**.
+
+O cache interno também muda sozinho: com MT5 (chamada local, sem limite de requisições), os dados atualizam a cada 3 segundos em vez de 60 — bem mais perto de "instantâneo".
+
+### Acessando do trabalho — deixando o PC de casa ligado
+
+Como o app agora roda no seu PC de casa (não mais na nuvem), acessar de outro lugar (como o trabalho) significa **acessar remotamente essa máquina**, não abrir uma URL pública qualquer. A forma mais simples e seripcelo de fazer isso, sem mexer em configuração de roteador:
+
+**Tailscale** (recomendado — gratuito, criptografado, sem abrir porta no roteador):
+1. Instala o [Tailscale](https://tailscale.com/download) no PC de casa e no computador do trabalho (ou no celular).
+2. Entra com a mesma conta (Google/Microsoft/etc) nos dois.
+3. Isso cria uma rede privada entre os dois dispositivos — o Tailscale te dá um endereço tipo `100.x.x.x` pro PC de casa.
+4. No trabalho, acessa `http://100.x.x.x:8501` no navegador — é como se estivesse na mesma rede de casa, mesmo estando longe.
+
+Isso é bem mais simples e seguro que abrir porta no roteador (o que expõe seu PC pra internet toda). Alternativas equivalentes: Cloudflare Tunnel ou ngrok, mas o Tailscale é o mais direto pra esse uso.
+
+**Resumo do que muda:**
+- PC de casa: MT5 aberto e logado + `streamlit run streamlit_app.py` rodando + Tailscale instalado.
+- PC do trabalho: só precisa do navegador + Tailscale instalado (pra entrar na mesma rede privada).
+- Se o PC de casa desligar ou o MT5 fechar, a fonte MT5 para de funcionar — pode trocar de volta pra Yahoo Finance na hora, sem precisar reiniciar nada.
+
 ## Filtro de modalidade — qual leitura decide a recomendação
 
 Seletor **Modalidade** na barra lateral, abaixo do Estilo de operação: **Todas as modalidades** (padrão), **Confluência**, **SMC**, **Price Action**, **Médias Móveis** ou **VWAP**.
