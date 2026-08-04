@@ -32,6 +32,7 @@ import re
 import statistics
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1668,6 +1669,171 @@ def check_signal_as_of(
         candles_ate_resultado=candles_to_result,
         candles_futuros_disponiveis=len(future),
     )
+
+
+# ========================================================================
+# Histórico de sinais — registra cada recomendação CONFIRMADA (com o
+# horário exato em que apareceu) e depois confere sozinho, com dados
+# reais buscados a partir daquele horário, se o preço já bateu o Alvo
+# 1, o Alvo 2 ou o Stop. É a versão "ao vivo" da Verificação
+# retroativa: lá você escolhe uma data passada pra testar; aqui o
+# sistema grava o sinal no momento em que ele aparece e confere
+# sozinho conforme o tempo passa.
+# ========================================================================
+
+SIGNAL_LOG_OPEN_STATUS = "ABERTO"
+SIGNAL_LOG_TERMINAL_STATUSES = ("ALVO_1", "ALVO_2", "STOP")
+
+
+def signal_log_file() -> Path:
+    """Arquivo local com o histórico de recomendações registradas."""
+    return Path(__file__).resolve().with_name("daytrade_signal_log.json")
+
+
+def load_signal_log() -> list[dict]:
+    path = signal_log_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def save_signal_log(entries: list[dict]) -> None:
+    path = signal_log_file()
+    path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def log_signal(
+    symbol: str,
+    timeframe: str,
+    style: str,
+    modality: str,
+    source: str,
+    signal: Signal,
+) -> dict | None:
+    """
+    Registra uma recomendação operável no histórico, com o horário
+    exato de agora. Só cria uma entrada nova se não houver outra
+    idêntica (mesmo ativo, timeframe, estilo, leitura e direção) ainda
+    em aberto — evita duplicar o mesmo sinal a cada atualização
+    automática ou re-render da tela. Devolve a entrada criada, ou
+    `None` se não criou (sinal não operável, ou já havia uma em
+    aberto).
+    """
+    if signal.direction == Direction.NEUTRAL or signal.risk.entry is None or signal.risk.stop is None:
+        return None
+
+    entries = load_signal_log()
+    for e in entries:
+        if (
+            e.get("status") == SIGNAL_LOG_OPEN_STATUS
+            and e.get("symbol") == symbol
+            and e.get("timeframe") == timeframe
+            and e.get("style") == style
+            and e.get("modality") == modality
+            and e.get("direction") == signal.direction.value
+        ):
+            return None  # já existe uma recomendação igual em aberto — não duplica
+
+    now_iso = pd.Timestamp.now(tz=LOCAL_TZ).isoformat()
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "logged_at": now_iso,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "style": style,
+        "modality": modality,
+        "source": source,
+        "direction": signal.direction.value,
+        "setup": signal.setup,
+        "score": round(signal.score, 1),
+        "entry": round(signal.risk.entry, 4),
+        "stop": round(signal.risk.stop, 4),
+        "target_1": round(signal.risk.target_1, 4) if signal.risk.target_1 is not None else None,
+        "target_2": round(signal.risk.target_2, 4) if signal.risk.target_2 is not None else None,
+        "status": SIGNAL_LOG_OPEN_STATUS,
+        "status_detail": "Aguardando verificação.",
+        "status_updated_at": now_iso,
+        "candles_ate_resultado": None,
+    }
+    entries.append(entry)
+    try:
+        save_signal_log(entries)
+    except OSError:
+        pass  # ambiente somente-leitura — o sinal fica só na sessão atual
+    return entry
+
+
+def refresh_signal_log(max_count: int = 400) -> list[dict]:
+    """
+    Percorre as recomendações ainda em aberto e verifica, com dados
+    reais buscados depois do horário exato de cada sinal, se o preço
+    já bateu o Alvo 1, o Alvo 2 ou o Stop (mesma lógica candle-a-candle
+    de `evaluate_signal_outcome`, usada na Verificação retroativa).
+    Cada entrada é reconferida usando a MESMA fonte de dados com que
+    foi registrada originalmente. Atualiza e salva o histórico.
+    """
+    entries = load_signal_log()
+    changed = False
+
+    for e in entries:
+        if e.get("status") != SIGNAL_LOG_OPEN_STATUS:
+            continue
+        try:
+            logged_at = pd.Timestamp(e["logged_at"])
+            logged_at_utc = (
+                logged_at.tz_convert("UTC") if logged_at.tzinfo is not None
+                else logged_at.tz_localize(LOCAL_TZ).tz_convert("UTC")
+            )
+
+            fetch_source = e.get("source") or "Yahoo Finance"
+            df = fetch_ohlcv(e["symbol"], e["timeframe"], max_count, source=fetch_source)
+            future = df[df.index > logged_at_utc]
+
+            if future.empty:
+                continue  # ainda não saiu candle novo depois do sinal — nada pra conferir por enquanto
+
+            risk = RiskPlan(
+                entry=e["entry"], stop=e["stop"],
+                target_1=e.get("target_1"), target_2=e.get("target_2"),
+            )
+            direction = Direction.BUY if e["direction"] == Direction.BUY.value else Direction.SELL
+
+            outcome, detail, candles = evaluate_signal_outcome(risk, direction, future)
+            if outcome in SIGNAL_LOG_TERMINAL_STATUSES:
+                e["status"] = outcome
+                e["status_detail"] = detail
+                e["status_updated_at"] = pd.Timestamp.now(tz=LOCAL_TZ).isoformat()
+                e["candles_ate_resultado"] = candles
+                changed = True
+        except Exception as exc:  # noqa: BLE001 — erro num ativo não pode travar a checagem dos outros
+            e["status_detail"] = f"Não foi possível verificar agora: {exc}"
+            changed = True
+
+    if changed:
+        try:
+            save_signal_log(entries)
+        except OSError:
+            pass
+    return entries
+
+
+def delete_signal_log_entry(entry_id: str) -> None:
+    entries = [e for e in load_signal_log() if e.get("id") != entry_id]
+    try:
+        save_signal_log(entries)
+    except OSError:
+        pass
+
+
+def clear_signal_log() -> None:
+    try:
+        save_signal_log([])
+    except OSError:
+        pass
 
 
 def analyze_symbol_mtf(

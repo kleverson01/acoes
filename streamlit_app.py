@@ -39,12 +39,17 @@ from daytrade_smc import (
     SWING_CONTEXT_TIMEFRAMES,
     analyze_symbol_mtf,
     check_signal_as_of,
+    clear_signal_log,
+    delete_signal_log_entry,
     fetch_snapshot_timestamp,
+    load_signal_log,
     load_symbols,
+    log_signal,
     overall_agreement,
     overall_direction,
     overall_score,
     quality,
+    refresh_signal_log,
     save_symbols,
     trigger_github_update,
     yahoo_symbol,
@@ -320,7 +325,7 @@ TIMEFRAME_LABELS = {
 }
 
 
-def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
+def render_confirmation_badge(mtf, confirmation: tuple[str, str], symbol: str, style: str, source: str) -> None:
     tf_a, tf_b = confirmation
     result_a = mtf.results[tf_a]
     result_b = mtf.results[tf_b]
@@ -347,15 +352,30 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
         color = DIRECTION_COLOR[mtf.confirmed_direction]
         if mtf.modality == ALL_MODALITIES_OPTION:
             score_for_badge = overall_score(result_a.signals)
+            confluence_a = next(s for s in result_a.signals if s.name == "Confluência")
+            # só registra o plano de risco da Confluência se ela concordar com a
+            # direção geral — senão não há entrada/stop/alvo coerentes pra logar
+            loggable_signal = (
+                Signal("Todas as modalidades", mtf.confirmed_direction, score_for_badge, score_for_badge,
+                       confluence_a.setup, risk=confluence_a.risk)
+                if confluence_a.direction == mtf.confirmed_direction else None
+            )
         else:
             score_for_badge = next(s.score for s in result_a.signals if s.name == mtf.modality)
+            loggable_signal = next(s for s in result_a.signals if s.name == mtf.modality)
+
+        if loggable_signal is not None:
+            logged = log_signal(symbol, tf_a, style, mtf.modality, source, loggable_signal)
+            if logged is not None:
+                st.toast(f"📝 Sinal registrado no histórico às {pd.Timestamp(logged['logged_at']).strftime('%H:%M:%S')}", icon="📝")
+
         star = "🌟 " if quality(score_for_badge) == "OPORTUNIDADE EXCEPCIONAL" else ""
         st.markdown(
             f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
             f'background:{color}18; margin-bottom:14px;">'
             f'{star}✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
             f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>."
-            f"{agreement_note}"
+            f"{agreement_note} · registrado automaticamente no histórico de sinais."
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -375,9 +395,103 @@ OUTCOME_LABELS = {
     "ALVO_2": ("✅ Bateu o Alvo 2", "#2ed3a3"),
     "STOP": ("❌ Bateu o Stop", "#ff5470"),
     "EM_ABERTO": ("⏳ Ainda em aberto", "#f0b429"),
+    "ABERTO": ("⏳ Em aberto", "#f0b429"),
     "SEM_SINAL": ("— Sem sinal operável nesta data", "#8291a1"),
     "SEM_DADO_FUTURO": ("⏳ Sem candles seguintes disponíveis ainda", "#8291a1"),
 }
+
+
+def render_signal_history() -> None:
+    st.caption(
+        "Toda recomendação **CONFIRMADA** (Análise individual ou Scanner) é registrada aqui "
+        "automaticamente, com o horário exato em que apareceu. Clique em **Verificar sinais em "
+        "aberto** para conferir, com dados reais buscados depois de cada sinal, se o preço já "
+        "bateu o Alvo 1, o Alvo 2 ou o Stop."
+    )
+
+    col1, col2, _ = st.columns([1.4, 1, 2])
+    with col1:
+        if st.button("🔄 Verificar sinais em aberto", type="primary", use_container_width=True):
+            with st.spinner("Conferindo sinais em aberto com dados reais..."):
+                refresh_signal_log()
+            st.rerun()
+    with col2:
+        if st.button("🗑️ Limpar histórico", use_container_width=True):
+            clear_signal_log()
+            st.rerun()
+
+    entries = load_signal_log()
+    if not entries:
+        st.info(
+            "Nenhuma recomendação registrada ainda. Elas aparecem aqui automaticamente assim que "
+            "uma análise (Individual ou Scanner) mostrar uma recomendação **CONFIRMADA** (os dois "
+            "timeframes de confirmação concordando)."
+        )
+        return
+
+    open_count = sum(1 for e in entries if e.get("status") == "ABERTO")
+    hit_count = sum(1 for e in entries if e.get("status") in ("ALVO_1", "ALVO_2"))
+    stop_count = sum(1 for e in entries if e.get("status") == "STOP")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total registrado", len(entries))
+    c2.metric("Em aberto", open_count)
+    c3.metric("Bateram alvo", hit_count)
+    c4.metric("Bateram stop", stop_count)
+
+    status_filter = st.multiselect(
+        "Filtrar por status",
+        ["ABERTO", "ALVO_1", "ALVO_2", "STOP"],
+        default=["ABERTO", "ALVO_1", "ALVO_2", "STOP"],
+        format_func=lambda s: OUTCOME_LABELS.get(s, (s, ""))[0],
+    )
+    symbol_filter = st.multiselect(
+        "Filtrar por ativo", sorted({e["symbol"] for e in entries}),
+    )
+
+    filtered = [e for e in entries if e.get("status") in status_filter]
+    if symbol_filter:
+        filtered = [e for e in filtered if e["symbol"] in symbol_filter]
+    filtered.sort(key=lambda e: e["logged_at"], reverse=True)
+
+    st.markdown("---")
+
+    if not filtered:
+        st.caption("Nenhum registro para os filtros selecionados.")
+        return
+
+    for e in filtered:
+        status = e.get("status", "ABERTO")
+        label, color = OUTCOME_LABELS.get(status, (status, "#8291a1"))
+        logged_dt = pd.Timestamp(e["logged_at"])
+        dir_color = DIRECTION_COLOR.get(Direction(e["direction"]), "#8291a1")
+
+        target_1_txt = f'R$ {e["target_1"]:.2f}' if e.get("target_1") is not None else "—"
+        target_2_txt = f' · Alvo 2 R$ {e["target_2"]:.2f}' if e.get("target_2") is not None else ""
+
+        st.markdown(
+            f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
+            f'background:{color}18; margin-bottom:10px;">'
+            f'<b>{e["symbol"]}</b> · {TIMEFRAME_LABELS.get(e["timeframe"], e["timeframe"])} · '
+            f'{e.get("style","")} · leitura: {e.get("modality","")} · '
+            f'<b style="color:{dir_color}">{e["direction"]}</b> · score {e.get("score","—")}/100'
+            f'<br>Recomendação registrada às <b>{logged_dt.strftime("%d/%m/%Y %H:%M:%S")}</b> · '
+            f'Entrada R$ {e["entry"]:.2f} · Stop R$ {e["stop"]:.2f} · Alvo 1 {target_1_txt}{target_2_txt}'
+            f'<br><b style="color:{color}">{label}</b>'
+            f' — {e.get("status_detail","")}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("Remover um registro específico"):
+        labels = {
+            f'{e["symbol"]} · {e["direction"]} · {pd.Timestamp(e["logged_at"]).strftime("%d/%m %H:%M")} · '
+            f'{OUTCOME_LABELS.get(e.get("status"), (e.get("status"), ""))[0]}': e["id"]
+            for e in filtered
+        }
+        pick_label = st.selectbox("Selecione o registro", list(labels.keys()))
+        if st.button("Remover este registro"):
+            delete_signal_log_entry(labels[pick_label])
+            st.rerun()
 
 
 def render_retro_check(symbol: str, style: str, modality: str, source: str, count: int) -> None:
@@ -442,7 +556,7 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
         mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source)
 
-    render_confirmation_badge(mtf, confirmation)
+    render_confirmation_badge(mtf, confirmation, symbol, style, source)
 
     tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] + (" (contexto)" if tf not in confirmation else "") for tf in all_tfs])
     for tab, tf in zip(tf_tabs, all_tfs):
@@ -555,6 +669,10 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
                 else f"Score geral (média de 5 leituras) — sem confirmação entre {tf_a}/{tf_b}"
             )
             risk = confluence_a.risk if (mtf.confirmed and confluence_a.direction == mtf.confirmed_direction) else None
+            loggable_signal = (
+                Signal("Todas as modalidades", mtf.confirmed_direction, score_a, score_a, confluence_a.setup, risk=risk)
+                if risk is not None else None
+            )
         else:
             conf_a = next(s for s in result_a.signals if s.name == modality)
             conf_b = next(s for s in result_b.signals if s.name == modality)
@@ -562,6 +680,10 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             score_b = round(conf_b.score, 1)
             setup_text = conf_a.setup if mtf.confirmed else f"{tf_a}={conf_a.direction.value} / {tf_b}={conf_b.direction.value}"
             risk = conf_a.risk if mtf.confirmed else None
+            loggable_signal = conf_a if mtf.confirmed else None
+
+        if mtf.confirmed and loggable_signal is not None:
+            log_signal(symbol, tf_a, style, modality, source, loggable_signal)
 
         direction_label = mtf.confirmed_direction.value if mtf.confirmed else "NEUTRO"
 
@@ -643,7 +765,11 @@ with st.sidebar:
     st.markdown("## 📊 Day Trade SMC")
     st.caption("SMC · Price Action · Médias Móveis · VWAP")
 
-    mode = st.radio("Modo", ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa"], key="mode_select")
+    mode = st.radio(
+        "Modo",
+        ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa", "Histórico de Sinais"],
+        key="mode_select",
+    )
 
     st.markdown("### Fonte de dados")
     source = st.radio(
@@ -807,6 +933,9 @@ elif mode == "Scanner (todos os ativos)":
     else:
         st.info("Clique em **Rodar scanner** na barra lateral para analisar todos os ativos da watchlist.")
 
-else:  # Verificação retroativa
+elif mode == "Verificação retroativa":
     symbol = st.session_state.symbol_select
     render_retro_check(symbol, style, modality, source, count)
+
+else:  # Histórico de Sinais
+    render_signal_history()
