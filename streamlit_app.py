@@ -680,7 +680,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
         if result_a.error or result_b.error:
             err = (result_a.error or result_b.error or "")[:60]
-            rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Destaque": "", "Direção": "ERRO", col_a: None,
+            rows.append({"Ativo": symbol, "Alerta": "", "Confirmado": "ERRO", "Destaque": "", "Direção": "ERRO", col_a: None,
                         col_b: None, "Score Geral": None, "Setup": err, "Entrada": None, "Stop": None,
                         "Alvo 1": None, "Quantidade": None, "Total (R$)": None})
             if source != "MetaTrader 5":
@@ -724,9 +724,11 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
         score_geral = round((score_a + score_b) / 2, 1)
         destaque = "🌟 Excepcional" if (mtf.confirmed and quality(score_geral) == "OPORTUNIDADE EXCEPCIONAL") else ""
+        alerta = f"⚠️ Abaixo do score mínimo ({min_score_to_log:.0f})" if score_geral < min_score_to_log else ""
 
         rows.append({
             "Ativo": symbol,
+            "Alerta": alerta,
             "Confirmado": "✅" if mtf.confirmed else "❌",
             "Destaque": destaque,
             "Direção": direction_label,
@@ -963,8 +965,11 @@ elif mode == "Scanner (todos os ativos)":
                 return "color: #ff5470; font-weight: 600"
             return "color: #8291a1"
 
+        def _color_alerta(val):
+            return "color: #f0b429; font-weight: 600" if val else ""
+
         st.dataframe(
-            result_df.style.map(_color_direction, subset=["Direção"]),
+            result_df.style.map(_color_direction, subset=["Direção"]).map(_color_alerta, subset=["Alerta"]),
             hide_index=True, use_container_width=True, height=min(450, 45 + 35 * len(result_df)),
         )
 
