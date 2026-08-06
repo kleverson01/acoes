@@ -22,4 +22,3 @@ MetaTrader5>=5.0.45
 # (inclusive dentro do workflow do GitHub Actions) reinstalaria a
 # versão mais nova e quebraria de novo.
 numpy==1.26.4
-
