@@ -385,13 +385,34 @@ def trigger_github_update() -> tuple[bool, str]:
     if not GITHUB_BRIDGE_REPO or not GITHUB_BRIDGE_TOKEN:
         return False, "Repositório ou token do GitHub não configurados (veja st.secrets)."
 
-    url = f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}/actions/workflows/mt5-update.yml/dispatches"
     headers = {
         "Authorization": f"token {GITHUB_BRIDGE_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
+
+    # Descobre a branch padrão do repositório (pode ser "main", "master"
+    # ou outra) em vez de supor — evita 404 por causa de um nome de
+    # branch diferente do esperado.
     try:
-        response = requests.post(url, headers=headers, json={"ref": "main"}, timeout=15)
+        repo_response = requests.get(
+            f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}", headers=headers, timeout=15
+        )
+    except Exception as exc:
+        return False, f"Falha ao consultar o repositório no GitHub: {exc}"
+
+    if repo_response.status_code == 404:
+        return False, (
+            f"Repositório '{GITHUB_BRIDGE_REPO}' não encontrado (HTTP 404). Confirme o nome "
+            "exato em st.secrets (formato usuario/repositorio) e se o token tem acesso a ele."
+        )
+    if repo_response.status_code != 200:
+        return False, f"Falha ao consultar o repositório (HTTP {repo_response.status_code}): {repo_response.text[:200]}"
+
+    default_branch = repo_response.json().get("default_branch", "main")
+
+    url = f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}/actions/workflows/mt5-update.yml/dispatches"
+    try:
+        response = requests.post(url, headers=headers, json={"ref": default_branch}, timeout=15)
     except Exception as exc:
         return False, f"Falha ao chamar a API do GitHub: {exc}"
 
@@ -399,8 +420,9 @@ def trigger_github_update() -> tuple[bool, str]:
         return True, "Atualização disparada — aguardando o PC de casa processar."
     if response.status_code == 404:
         return False, (
-            "Workflow não encontrado (HTTP 404). Confirme se o arquivo "
-            ".github/workflows/mt5-update.yml foi commitado e se o token tem permissão 'workflow'."
+            f"Workflow não encontrado (HTTP 404) na branch '{default_branch}'. Confirme se o "
+            "arquivo .github/workflows/mt5-update.yml foi commitado NESSA branch e se o token "
+            "tem permissão 'workflow' (ou 'Actions: Read and write', se for token fine-grained)."
         )
     return False, f"Falha ao disparar (HTTP {response.status_code}): {response.text[:200]}"
 
