@@ -271,6 +271,16 @@ DATA_SOURCES = ("Yahoo Finance", "MetaTrader 5", "GitHub (MT5 de casa)")
 GITHUB_BRIDGE_REPO: str | None = None
 GITHUB_BRIDGE_TOKEN: str | None = None
 
+# Piso mínimo da distância do stop, em múltiplos do ATR do timeframe.
+# Mesmo padrão de configuração acima: variável de módulo, ajustável
+# pela interface (barra lateral) sem precisar editar código. Valor
+# baixo (ex: 0.75) deixa o stop mais apertado — mais operações, porém
+# mais vulnerável a ser tocado só por ruído normal do candle seguinte,
+# especialmente em ativos de baixa volatilidade no M15. Valor mais
+# alto (ex: 1.25-1.5) reduz esse "stop por ruído", ao custo de um
+# risco por operação maior.
+MIN_STOP_ATR_MULT: float = 1.0
+
 _MT5_TIMEFRAME_MAP_NAMES = {"M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1"}
 
 
@@ -1406,12 +1416,12 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
 
     entry = round_tick(float(context.df["close"].iloc[-1]), "nearest")
     stop, basis = stop_for_signal(signal, context)
-    minimum_distance = context.atr * 0.75
+    minimum_distance = context.atr * MIN_STOP_ATR_MULT
 
     if signal.direction == Direction.BUY:
         if entry - stop < minimum_distance:
             stop = entry - minimum_distance
-            basis += "+mínimo_0.75ATR"
+            basis += f"+mínimo_{MIN_STOP_ATR_MULT:.2f}ATR"
         stop = round_tick(stop, "floor")
         risk = entry - stop
         if risk <= 0:
@@ -1422,7 +1432,7 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
     else:
         if stop - entry < minimum_distance:
             stop = entry + minimum_distance
-            basis += "+mínimo_0.75ATR"
+            basis += f"+mínimo_{MIN_STOP_ATR_MULT:.2f}ATR"
         stop = round_tick(stop, "ceil")
         risk = stop - entry
         if risk <= 0:

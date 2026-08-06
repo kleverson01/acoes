@@ -92,24 +92,27 @@ DIRECTION_COLOR = {
 # Dados / cache / análise
 # ========================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float):
+    daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance")
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float):
+    daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5")
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float):
+    daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)")
 
 
-def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str):
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, min_stop_atr_mult: float):
     """
     Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
     rate limit); MetaTrader 5 direto usa 3s; GitHub (MT5 de casa) usa
@@ -118,12 +121,17 @@ def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: 
     dinamicamente, pelo mesmo motivo dos fragmentos de auto-refresh:
     evita o bug de identidade de widget no React já corrigido antes
     neste projeto.
+
+    `min_stop_atr_mult` entra como parâmetro (não só variável global)
+    justamente pra fazer parte da CHAVE do cache — sem isso, mudar o
+    piso do stop na barra lateral continuaria mostrando, por alguns
+    segundos, resultado calculado com o valor antigo.
     """
     if source == "MetaTrader 5":
-        return _cached_mtf_mt5(symbol, count, confirmation, context, modality)
+        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, min_stop_atr_mult)
     if source == "GitHub (MT5 de casa)":
-        return _cached_mtf_github(symbol, count, confirmation, context, modality)
-    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality)
+        return _cached_mtf_github(symbol, count, confirmation, context, modality, min_stop_atr_mult)
+    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, min_stop_atr_mult)
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
@@ -325,7 +333,7 @@ TIMEFRAME_LABELS = {
 }
 
 
-def render_confirmation_badge(mtf, confirmation: tuple[str, str], symbol: str, style: str, source: str) -> None:
+def render_confirmation_badge(mtf, confirmation: tuple[str, str], symbol: str, style: str, source: str, min_score_to_log: float) -> None:
     tf_a, tf_b = confirmation
     result_a = mtf.results[tf_a]
     result_b = mtf.results[tf_b]
@@ -364,21 +372,40 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str], symbol: str, s
             score_for_badge = next(s.score for s in result_a.signals if s.name == mtf.modality)
             loggable_signal = next(s for s in result_a.signals if s.name == mtf.modality)
 
-        if loggable_signal is not None:
+        below_threshold = score_for_badge < min_score_to_log
+
+        if loggable_signal is not None and not below_threshold:
             logged = log_signal(symbol, tf_a, style, mtf.modality, source, loggable_signal)
             if logged is not None:
                 st.toast(f"📝 Sinal registrado no histórico às {pd.Timestamp(logged['logged_at']).strftime('%H:%M:%S')}", icon="📝")
 
         star = "🌟 " if quality(score_for_badge) == "OPORTUNIDADE EXCEPCIONAL" else ""
-        st.markdown(
-            f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
-            f'background:{color}18; margin-bottom:14px;">'
-            f'{star}✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
-            f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>."
-            f"{agreement_note} · registrado automaticamente no histórico de sinais."
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+
+        if below_threshold:
+            # Confirmado (M15+H1 concordam), mas score abaixo do piso de
+            # qualidade escolhido na barra lateral — mostra pra estudo,
+            # mas NÃO registra como recomendação no histórico, pra não
+            # misturar sinais fracos com sinais fortes nas estatísticas.
+            st.markdown(
+                f'<div style="border:1px solid #8291a1; border-radius:8px; padding:12px 16px; '
+                f'background:#8291a118; margin-bottom:14px;">'
+                f'⚠️ <b>CONFIRMADO, mas score baixo</b> ({score_for_badge:.1f}/100, abaixo do mínimo de '
+                f'{min_score_to_log:.0f} definido na barra lateral) — direção <b style="color:{color}">'
+                f'{mtf.confirmed_direction.value}</b> segundo <b>{mtf.modality}</b>.{agreement_note} '
+                f"Não foi registrado no histórico de sinais."
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
+                f'background:{color}18; margin-bottom:14px;">'
+                f'{star}✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
+                f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>."
+                f"{agreement_note} · registrado automaticamente no histórico de sinais."
+                f"</div>",
+                unsafe_allow_html=True,
+            )
     else:
         st.markdown(
             f'<div style="border:1px solid #8291a1; border-radius:8px; padding:12px 16px; '
@@ -547,16 +574,16 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
             st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
 
 
-def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None) -> None:
+def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None, min_stop_atr_mult: float, min_score_to_log: float) -> None:
     confirmation = STYLES[style]["confirmation"]
     context_tfs = STYLES[style]["context"]
     all_tfs = list(confirmation) + [tf for tf in context_tfs if tf not in confirmation]
 
     fonte_label = "MT5 (tempo real)" if source == "MetaTrader 5" else "Yahoo Finance (atraso ~15-20min)"
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult)
 
-    render_confirmation_badge(mtf, confirmation, symbol, style, source)
+    render_confirmation_badge(mtf, confirmation, symbol, style, source, min_score_to_log)
 
     tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] + (" (contexto)" if tf not in confirmation else "") for tf in all_tfs])
     for tab, tf in zip(tf_tabs, all_tfs):
@@ -610,23 +637,23 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
 # fixo por intervalo, nunca criado dinamicamente.
 # ========================================================================
 @st.fragment(run_every=30)
-def _auto_refresh_30(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_30(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
 
 
 @st.fragment(run_every=60)
-def _auto_refresh_60(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_60(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
 
 
 @st.fragment(run_every=120)
-def _auto_refresh_120(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_120(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
 
 
 @st.fragment(run_every=300)
-def _auto_refresh_300(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_300(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
 
 
 _AUTO_REFRESH_FRAGMENTS = {
@@ -637,7 +664,7 @@ _AUTO_REFRESH_FRAGMENTS = {
 }
 
 
-def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None) -> pd.DataFrame:
+def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None, min_stop_atr_mult: float, min_score_to_log: float) -> pd.DataFrame:
     rows = []
     progress = st.progress(0.0, text="Iniciando scanner...")
     confirmation = STYLES[style]["confirmation"]
@@ -647,7 +674,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
@@ -682,7 +709,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             risk = conf_a.risk if mtf.confirmed else None
             loggable_signal = conf_a if mtf.confirmed else None
 
-        if mtf.confirmed and loggable_signal is not None:
+        if mtf.confirmed and loggable_signal is not None and loggable_signal.score >= min_score_to_log:
             log_signal(symbol, tf_a, style, modality, source, loggable_signal)
 
         direction_label = mtf.confirmed_direction.value if mtf.confirmed else "NEUTRO"
@@ -866,6 +893,22 @@ with st.sidebar:
     risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
     risk_budget = risk_budget if risk_budget > 0 else None
 
+    st.markdown("### Filtros de qualidade")
+    min_stop_atr_mult = st.slider(
+        "Piso mínimo do stop (× ATR)", min_value=0.5, max_value=2.5, value=1.0, step=0.25,
+        help="Distância mínima entre entrada e stop, em múltiplos do ATR do timeframe. Valor baixo "
+             "(ex: 0.75) deixa o stop mais apertado — mais sinais, porém mais vulnerável a ser tocado "
+             "só por ruído normal do candle seguinte. Valor mais alto (ex: 1.5) reduz esse \"stop por "
+             "ruído\", ao custo de arriscar mais por operação.",
+    )
+    min_score_to_log = st.slider(
+        "Score mínimo para registrar no histórico", min_value=0, max_value=100, value=55, step=5,
+        help="Recomendações CONFIRMADAS (M15+H1 concordando) com score abaixo deste valor ainda "
+             "aparecem na tela pra estudo, mas não são registradas no Histórico de Sinais — evita "
+             "misturar sinais fracos com sinais fortes nas estatísticas de acerto.",
+    )
+    daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
+
     if mode == "Análise individual":
         st.markdown("### Atualização")
         auto_refresh = st.checkbox("Atualizar automaticamente")
@@ -894,16 +937,16 @@ if mode == "Análise individual":
 
     if auto_refresh:
         st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget)
+        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
     else:
-        render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+        render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
 
 elif mode == "Scanner (todos os ativos)":
     st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
               f"{count} candles · recomendação exige {conf_a}+{conf_b} concordando")
 
     if run_scanner_clicked:
-        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget)
+        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
         st.session_state.scanner_risk_budget = risk_budget
 
     if "scanner_result" in st.session_state:
