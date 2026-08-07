@@ -51,7 +51,6 @@ from daytrade_smc import (
     quality,
     refresh_signal_log,
     save_symbols,
-    trigger_github_update,
     yahoo_symbol,
 )
 
@@ -806,7 +805,7 @@ with st.sidebar:
         help="Yahoo Finance funciona em qualquer lugar, com atraso de ~15-20min. MetaTrader 5 "
              "direto é tempo real, mas só funciona rodando este app na máquina com o MT5 aberto. "
              "\"GitHub (MT5 de casa)\" funciona de qualquer lugar (inclusive do trabalho) e busca "
-             "dado real do MT5, mas só atualiza quando você clicar em \"Atualizar via MT5\".",
+             "dado real do MT5, publicado automaticamente pelo PC de casa a cada poucos minutos.",
     )
     if source == "MetaTrader 5":
         st.caption(
@@ -817,35 +816,22 @@ with st.sidebar:
     elif source == "GitHub (MT5 de casa)":
         last_update = fetch_snapshot_timestamp()
         if last_update:
-            st.caption(f"📅 Última atualização: {pd.Timestamp(last_update).tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M:%S')}")
+            age_min = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(last_update)).total_seconds() / 60
+            st.caption(
+                f"📅 Última atualização: {pd.Timestamp(last_update).tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M:%S')} "
+                f"(há {age_min:.0f} min)"
+            )
+            if age_min > 15:
+                st.warning(
+                    "Snapshot com mais de 15 minutos — confirme se o PC de casa está ligado, o "
+                    "MT5 aberto e logado, e a tarefa agendada de sincronização rodando."
+                )
         else:
-            st.caption("Nenhuma atualização publicada ainda — clique no botão abaixo.")
+            st.caption("Nenhuma atualização publicada ainda pelo PC de casa.")
 
-        if st.button("🔄 Atualizar via MT5 (casa)", use_container_width=True):
-            ok, msg = trigger_github_update()
-            if not ok:
-                st.error(msg)
-            else:
-                st.cache_data.clear()
-                with st.spinner("Aguardando seu computador em casa processar (isso leva alguns segundos)..."):
-                    trigger_time = pd.Timestamp.now(tz="UTC")
-                    updated = False
-                    for _ in range(30):  # até ~90s de espera (30 x 3s)
-                        time.sleep(3)
-                        ts = fetch_snapshot_timestamp()
-                        if ts and pd.Timestamp(ts) > trigger_time:
-                            updated = True
-                            break
-                if updated:
-                    st.cache_data.clear()
-                    st.success("Dados atualizados!")
-                    st.rerun()
-                else:
-                    st.warning(
-                        "Não detectei a atualização em 90s. Confirme se o PC de casa está "
-                        "ligado, o MT5 aberto e logado, e o runner do GitHub Actions rodando. "
-                        "Pode levar mais tempo em alguns casos — tenta de novo em instantes."
-                    )
+        if st.button("🔄 Verificar nova atualização", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
 
     st.markdown("### Estilo de operação")
     style = st.radio(
