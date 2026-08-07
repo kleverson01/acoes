@@ -399,56 +399,57 @@ def fetch_snapshot_timestamp() -> str | None:
         return None
 
 
-def trigger_github_update() -> tuple[bool, str]:
+def request_mt5_update() -> tuple[bool, str]:
     """
-    Dispara o workflow do GitHub Actions (workflow_dispatch) que aciona
-    o runner no PC de casa. Devolve (sucesso, mensagem).
+    Grava um "pedido de atualização" direto no repositório (só um
+    arquivo pequeno com o horário do pedido) — SEM usar GitHub
+    Actions. Um script "vigia" rodando no PC de casa fica checando
+    esse arquivo a cada poucos segundos e, ao notar um pedido novo,
+    busca os dados no MT5 e publica. Devolve (sucesso, mensagem).
     """
+    import base64
     import requests
 
     if not GITHUB_BRIDGE_REPO or not GITHUB_BRIDGE_TOKEN:
         return False, "Repositório ou token do GitHub não configurados (veja st.secrets)."
 
+    path = "data/update_request.json"
+    url = f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}/contents/{path}"
     headers = {
         "Authorization": f"token {GITHUB_BRIDGE_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
 
-    # Descobre a branch padrão do repositório (pode ser "main", "master"
-    # ou outra) em vez de supor — evita 404 por causa de um nome de
-    # branch diferente do esperado.
+    # A API de "contents" do GitHub exige o SHA atual do arquivo pra
+    # poder sobrescrever (se ele já existir); se ainda não existir,
+    # não precisa de SHA — ela cria um arquivo novo.
+    sha = None
     try:
-        repo_response = requests.get(
-            f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}", headers=headers, timeout=15
-        )
+        get_response = requests.get(url, headers=headers, timeout=15)
+        if get_response.status_code == 200:
+            sha = get_response.json().get("sha")
+        elif get_response.status_code not in (200, 404):
+            return False, f"Falha ao consultar o arquivo de pedido (HTTP {get_response.status_code})."
     except Exception as exc:
-        return False, f"Falha ao consultar o repositório no GitHub: {exc}"
+        return False, f"Falha ao consultar o repositório: {exc}"
 
-    if repo_response.status_code == 404:
-        return False, (
-            f"Repositório '{GITHUB_BRIDGE_REPO}' não encontrado (HTTP 404). Confirme o nome "
-            "exato em st.secrets (formato usuario/repositorio) e se o token tem acesso a ele."
-        )
-    if repo_response.status_code != 200:
-        return False, f"Falha ao consultar o repositório (HTTP {repo_response.status_code}): {repo_response.text[:200]}"
+    now_iso = pd.Timestamp.now(tz="UTC").isoformat()
+    content_json = json.dumps({"requested_at": now_iso}, ensure_ascii=False)
+    payload = {
+        "message": f"Pedido de atualizacao via MT5 - {now_iso}",
+        "content": base64.b64encode(content_json.encode("utf-8")).decode("ascii"),
+    }
+    if sha:
+        payload["sha"] = sha
 
-    default_branch = repo_response.json().get("default_branch", "main")
-
-    url = f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}/actions/workflows/mt5-update.yml/dispatches"
     try:
-        response = requests.post(url, headers=headers, json={"ref": default_branch}, timeout=15)
+        put_response = requests.put(url, headers=headers, json=payload, timeout=15)
     except Exception as exc:
-        return False, f"Falha ao chamar a API do GitHub: {exc}"
+        return False, f"Falha ao gravar o pedido no GitHub: {exc}"
 
-    if response.status_code == 204:
-        return True, "Atualização disparada — aguardando o PC de casa processar."
-    if response.status_code == 404:
-        return False, (
-            f"Workflow não encontrado (HTTP 404) na branch '{default_branch}'. Confirme se o "
-            "arquivo .github/workflows/mt5-update.yml foi commitado NESSA branch e se o token "
-            "tem permissão 'workflow' (ou 'Actions: Read and write', se for token fine-grained)."
-        )
-    return False, f"Falha ao disparar (HTTP {response.status_code}): {response.text[:200]}"
+    if put_response.status_code in (200, 201):
+        return True, "Pedido enviado — aguardando o PC de casa processar."
+    return False, f"Falha ao gravar o pedido (HTTP {put_response.status_code}): {put_response.text[:200]}"
 
 
 def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
