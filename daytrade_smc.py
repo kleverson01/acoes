@@ -334,7 +334,7 @@ def _fetch_ohlcv_github(symbol: str, timeframe: str, count: int) -> pd.DataFrame
             "st.secrets['github_repo'] no formato 'usuario/nome-do-repositorio'."
         )
 
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json"
+    url = _bust_cache_url(f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json")
     headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
 
     try:
@@ -371,13 +371,24 @@ def _fetch_ohlcv_github(symbol: str, timeframe: str, count: int) -> pd.DataFrame
     return df[["open", "high", "low", "close", "volume"]].tail(count)
 
 
+def _bust_cache_url(url: str) -> str:
+    """
+    Acrescenta um parâmetro que muda a cada chamada, pra evitar que o
+    CDN do GitHub (raw.githubusercontent.com) devolva uma cópia em
+    cache do arquivo — sem isso, a "Última atualização" pode ficar
+    presa numa versão antiga por vários minutos mesmo depois de um
+    push novo.
+    """
+    return f"{url}?_cb={int(time.time() * 1000)}"
+
+
 def fetch_snapshot_timestamp() -> str | None:
     """Devolve o horário (ISO, UTC) do snapshot mais recente publicado no GitHub, ou None se não houver nenhum ainda."""
     import requests
 
     if not GITHUB_BRIDGE_REPO:
         return None
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json"
+    url = _bust_cache_url(f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json")
     headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
     try:
         response = requests.get(url, headers=headers, timeout=10)
