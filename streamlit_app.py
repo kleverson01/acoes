@@ -50,6 +50,7 @@ from daytrade_smc import (
     overall_score,
     quality,
     refresh_signal_log,
+    request_mt5_update,
     save_symbols,
     yahoo_symbol,
 )
@@ -821,17 +822,34 @@ with st.sidebar:
                 f"📅 Última atualização: {pd.Timestamp(last_update).tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M:%S')} "
                 f"(há {age_min:.0f} min)"
             )
-            if age_min > 15:
-                st.warning(
-                    "Snapshot com mais de 15 minutos — confirme se o PC de casa está ligado, o "
-                    "MT5 aberto e logado, e a tarefa agendada de sincronização rodando."
-                )
         else:
             st.caption("Nenhuma atualização publicada ainda pelo PC de casa.")
 
-        if st.button("🔄 Verificar nova atualização", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+        if st.button("🔄 Atualizar via MT5 (casa)", use_container_width=True):
+            ok, msg = request_mt5_update()
+            if not ok:
+                st.error(msg)
+            else:
+                st.cache_data.clear()
+                with st.spinner("Aguardando seu computador em casa processar (isso leva alguns segundos)..."):
+                    trigger_time = pd.Timestamp.now(tz="UTC")
+                    updated = False
+                    for _ in range(24):  # até ~2min de espera (24 x 5s) -- o vigia no PC checa a cada 15s
+                        time.sleep(5)
+                        ts = fetch_snapshot_timestamp()
+                        if ts and pd.Timestamp(ts) > trigger_time:
+                            updated = True
+                            break
+                if updated:
+                    st.cache_data.clear()
+                    st.success("Dados atualizados!")
+                    st.rerun()
+                else:
+                    st.warning(
+                        "Não detectei a atualização em 2 minutos. Confirme se o PC de casa está "
+                        "ligado, o MT5 aberto e logado, e o script 'vigia' (watch_and_sync.ps1) "
+                        "rodando. Pode levar mais tempo em alguns casos — tenta de novo em instantes."
+                    )
 
     st.markdown("### Estilo de operação")
     style = st.radio(
