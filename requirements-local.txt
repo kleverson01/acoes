@@ -22,3 +22,11 @@ MetaTrader5>=5.0.45
 # (inclusive dentro do workflow do GitHub Actions) reinstalaria a
 # versão mais nova e quebraria de novo.
 numpy==1.26.4
+
+# Mesmo motivo do NumPy acima: a partir da 2.2, os wheels do Pandas
+# pra Windows também passaram a exigir "x86-64-v2" — nesta máquina,
+# isso não dá um erro Python normal, trava o processo inteiro sem
+# nenhuma mensagem (código de saída -1073741795 / 0xC000001D,
+# "instrução ilegal"). A 2.1.4 funciona com o baseline SSE2 normal.
+pandas==2.1.4
+
