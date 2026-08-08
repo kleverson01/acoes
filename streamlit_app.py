@@ -6,7 +6,7 @@ nada do motor — só importa as funções e desenha por cima.
 
 Dois modos (barra lateral):
     - Análise individual: gráfico de candles com EMAs/VWAP/swings/BOS-CHoCH/
-      zonas de FVG, mais os painéis das 5 leituras. Pode auto-atualizar.
+      zonas de FVG, mais os painéis das 6 leituras. Pode auto-atualizar.
     - Scanner: roda a análise em TODOS os ativos da watchlist de uma vez e
       mostra um ranking por score de confluência (o "Top N" do requisito
       original), com atalho pra abrir qualquer um na análise individual.
@@ -70,7 +70,7 @@ STYLES = {
     "Day Trade": {
         "confirmation": DAYTRADE_CONFIRMATION_TIMEFRAMES,
         "context": DAYTRADE_CONTEXT_TIMEFRAMES,
-        "count_label": "Candles fechados (M15 e H1)",
+        "count_label": "Candles fechados (M5, M15 e H1)",
     },
     "Swing Trade": {
         "confirmation": SWING_CONFIRMATION_TIMEFRAMES,
@@ -92,27 +92,33 @@ DIRECTION_COLOR = {
 # Dados / cache / análise
 # ========================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float):
+def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
+    daytrade_smc.RSI_OVERSOLD = rsi_os
+    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance")
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float):
+def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
+    daytrade_smc.RSI_OVERSOLD = rsi_os
+    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5")
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float):
+def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
+    daytrade_smc.RSI_OVERSOLD = rsi_os
+    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)")
 
 
-def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, min_stop_atr_mult: float):
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     """
     Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
     rate limit); MetaTrader 5 direto usa 3s; GitHub (MT5 de casa) usa
@@ -128,10 +134,10 @@ def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: 
     segundos, resultado calculado com o valor antigo.
     """
     if source == "MetaTrader 5":
-        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, min_stop_atr_mult)
+        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
     if source == "GitHub (MT5 de casa)":
-        return _cached_mtf_github(symbol, count, confirmation, context, modality, min_stop_atr_mult)
-    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, min_stop_atr_mult)
+        return _cached_mtf_github(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
+    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
@@ -325,6 +331,7 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) 
 
 
 TIMEFRAME_LABELS = {
+    "M5": "5 minutos",
     "M15": "15 minutos",
     "H1": "60 minutos",
     "H4": "240 minutos",
@@ -574,16 +581,17 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
             st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
 
 
-def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None, min_stop_atr_mult: float, min_score_to_log: float) -> None:
+def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None, min_stop_atr_mult: float, min_score_to_log: float, rsi_os: float, rsi_ob: float) -> None:
     confirmation = STYLES[style]["confirmation"]
     context_tfs = STYLES[style]["context"]
     all_tfs = list(confirmation) + [tf for tf in context_tfs if tf not in confirmation]
 
     fonte_label = "MT5 (tempo real)" if source == "MetaTrader 5" else "Yahoo Finance (atraso ~15-20min)"
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob)
 
     render_confirmation_badge(mtf, confirmation, symbol, style, source, min_score_to_log)
+    render_rsi_multi_tf(mtf)
 
     tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] + (" (contexto)" if tf not in confirmation else "") for tf in all_tfs])
     for tab, tf in zip(tf_tabs, all_tfs):
@@ -595,6 +603,84 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
             render_timeframe_panel(symbol, tf, result.context, result.signals, risk_budget)
 
 
+def render_rsi_multi_tf(mtf) -> None:
+    """Consolida os extremos de IFR de todos os timeframes analisados."""
+    resumo = daytrade_smc.rsi_extremes_across_timeframes(mtf)
+    por_tf = resumo["por_tf"]
+    if not por_tf:
+        return
+
+    ob, os_ = daytrade_smc.RSI_OVERBOUGHT, daytrade_smc.RSI_OVERSOLD
+    alinhamento, direcao = resumo["alinhamento"], resumo["direcao"]
+
+    partes = []
+    for tf, (valor, extremo) in por_tf.items():
+        rotulo = TIMEFRAME_LABELS.get(tf, tf)
+        if extremo == Direction.BUY.value:
+            partes.append(f'<b style="color:#2ed3a3">{rotulo}: {valor:.0f} ↓</b>')
+        elif extremo == Direction.SELL.value:
+            partes.append(f'<b style="color:#ff5470">{rotulo}: {valor:.0f} ↑</b>')
+        else:
+            partes.append(f'<span style="color:#8291a1">{rotulo}: {valor:.0f}</span>')
+
+    if alinhamento >= 2:
+        cor = "#2ed3a3" if direcao == Direction.BUY.value else "#ff5470"
+        titulo = (f'🎯 <b style="color:{cor}">EXAUSTÃO EM {alinhamento} TIMEFRAMES — {direcao}</b>')
+    elif alinhamento == 1:
+        cor = "#f0b429"
+        titulo = f'<b style="color:{cor}">Exaustão em 1 timeframe — {direcao}</b>'
+    else:
+        cor = "#8291a1"
+        titulo = '<span style="color:#8291a1">Nenhum timeframe em exaustão</span>'
+
+    st.markdown(
+        f'<div style="border:1px solid {cor}; border-radius:8px; padding:10px 14px; '
+        f'background:{cor}18; margin:6px 0 14px 0;">'
+        f'{titulo} <span style="color:#8291a1">· limiares {os_:.0f}/{ob:.0f}</span><br>'
+        f'<span style="font-size:0.92em">IFR(14) — {" · ".join(partes)}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_rsi_badge(context) -> None:
+    """Faixa visual do IFR do timeframe atual, com o Diário ao lado quando disponível."""
+    rsi = context.rsi
+    ob, os_ = daytrade_smc.RSI_OVERBOUGHT, daytrade_smc.RSI_OVERSOLD
+    near_os = os_ + (50 - os_) * 0.35
+    near_ob = ob - (ob - 50) * 0.35
+
+    if rsi <= os_:
+        zona, cor = f"SOBREVENDA EXTREMA (≤{os_:.0f})", "#2ed3a3"
+    elif rsi >= ob:
+        zona, cor = f"SOBRECOMPRA EXTREMA (≥{ob:.0f})", "#ff5470"
+    elif rsi <= near_os:
+        zona, cor = "Aproximando da sobrevenda", "#f0b429"
+    elif rsi >= near_ob:
+        zona, cor = "Aproximando da sobrecompra", "#f0b429"
+    else:
+        zona, cor = "Fora dos extremos", "#8291a1"
+
+    diario = ""
+    if context.higher_rsi is not None:
+        d = context.higher_rsi
+        d_zona = "extremo ↓" if d <= os_ else "extremo ↑" if d >= ob else "neutro"
+        diario = f" · <b>Diário:</b> {d:.1f} ({d_zona})"
+
+    st.markdown(
+        f'<div style="border:1px solid {cor}; border-radius:8px; padding:10px 14px; '
+        f'background:{cor}18; margin:6px 0 14px 0;">'
+        f'<b>IFR (14):</b> <b style="color:{cor}">{rsi:.1f} — {zona}</b>{diario}'
+        f'<div style="background:#8291a133; height:8px; border-radius:4px; margin-top:8px; position:relative;">'
+        f'<div style="position:absolute; left:{os_:.0f}%; top:0; bottom:0; width:1px; background:#8291a1;"></div>'
+        f'<div style="position:absolute; left:{ob:.0f}%; top:0; bottom:0; width:1px; background:#8291a1;"></div>'
+        f'<div style="position:absolute; left:calc({min(max(rsi,0),100):.0f}% - 4px); top:-2px; '
+        f'width:8px; height:12px; border-radius:2px; background:{cor};"></div>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_budget: float | None) -> None:
     by_name = {s.name: s for s in signals}
     last_open = context.df.index[-1].tz_convert("America/Sao_Paulo")
@@ -602,6 +688,8 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
               f"ATR {context.atr:.2f} ({context.atr_pct:.2f}%) · RVOL {context.rvol:.2f}x · "
               f"Volatilidade {context.volatility} · atualizado às "
               f"{pd.Timestamp.now(tz='America/Sao_Paulo').strftime('%H:%M:%S')}")
+
+    render_rsi_badge(context)
 
     chart_choice = st.selectbox(
         "Ver entrada/stop/alvo de qual leitura no gráfico:",
@@ -614,7 +702,7 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
         with tab:
             render_signal_panel(s, symbol, risk_budget)
 
-    st.markdown("### Resumo — as 5 leituras lado a lado")
+    st.markdown("### Resumo — as 6 leituras lado a lado")
     st.dataframe(
         [{
             "Análise": s.name, "Direção": s.direction.value, "Score": round(s.score, 1),
@@ -637,23 +725,23 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
 # fixo por intervalo, nunca criado dinamicamente.
 # ========================================================================
 @st.fragment(run_every=30)
-def _auto_refresh_30(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
+def _auto_refresh_30(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
 
 
 @st.fragment(run_every=60)
-def _auto_refresh_60(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
+def _auto_refresh_60(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
 
 
 @st.fragment(run_every=120)
-def _auto_refresh_120(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
+def _auto_refresh_120(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
 
 
 @st.fragment(run_every=300)
-def _auto_refresh_300(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
+def _auto_refresh_300(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
 
 
 _AUTO_REFRESH_FRAGMENTS = {
@@ -664,7 +752,7 @@ _AUTO_REFRESH_FRAGMENTS = {
 }
 
 
-def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None, min_stop_atr_mult: float, min_score_to_log: float) -> pd.DataFrame:
+def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None, min_stop_atr_mult: float, min_score_to_log: float, rsi_os: float, rsi_ob: float) -> pd.DataFrame:
     rows = []
     progress = st.progress(0.0, text="Iniciando scanner...")
     confirmation = STYLES[style]["confirmation"]
@@ -674,14 +762,15 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
         if result_a.error or result_b.error:
             err = (result_a.error or result_b.error or "")[:60]
             rows.append({"Ativo": symbol, "Alerta": "", "Confirmado": "ERRO", "Destaque": "", "Direção": "ERRO", col_a: None,
-                        col_b: None, "Score Geral": None, "Setup": err, "Entrada": None, "Stop": None,
+                        col_b: None, "Score Geral": None, f"IFR {tf_a}": None, "IFR Diário": None, "Zona IFR": "", "Exaustão IFR": "",
+                        "Setup": err, "Entrada": None, "Stop": None,
                         "Alvo 1": None, "Quantidade": None, "Total (R$)": None})
             if source != "MetaTrader 5":
                 time.sleep(0.3)
@@ -692,8 +781,8 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             score_b = round(overall_score(result_b.signals), 1)
             confluence_a = next(s for s in result_a.signals if s.name == "Confluência")
             setup_text = (
-                f"Score geral (média de 5 leituras) — {confluence_a.setup}" if mtf.confirmed
-                else f"Score geral (média de 5 leituras) — sem confirmação entre {tf_a}/{tf_b}"
+                f"Score geral (média de 6 leituras) — {confluence_a.setup}" if mtf.confirmed
+                else f"Score geral (média de 6 leituras) — sem confirmação entre {tf_a}/{tf_b}"
             )
             risk = confluence_a.risk if (mtf.confirmed and confluence_a.direction == mtf.confirmed_direction) else None
             loggable_signal = (
@@ -726,6 +815,31 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
         destaque = "🌟 Excepcional" if (mtf.confirmed and quality(score_geral) == "OPORTUNIDADE EXCEPCIONAL") else ""
         alerta = f"⚠️ Abaixo do score mínimo ({min_score_to_log:.0f})" if score_geral < min_score_to_log else ""
 
+        rsi_tf = round(result_a.context.rsi, 1) if result_a.context else None
+        d1_result = mtf.results.get("D1")
+        rsi_d1 = round(d1_result.context.rsi, 1) if (d1_result and d1_result.context) else None
+        if rsi_tf is None:
+            rsi_zona = ""
+        elif rsi_tf <= rsi_os:
+            rsi_zona = "🟢 Sobrevenda extrema"
+        elif rsi_tf >= rsi_ob:
+            rsi_zona = "🔴 Sobrecompra extrema"
+        else:
+            rsi_zona = ""
+
+        # Quantos timeframes estão em exaustão simultânea na mesma
+        # direção — é o filtro mais seletivo que o IFR oferece aqui.
+        resumo_rsi = daytrade_smc.rsi_extremes_across_timeframes(mtf)
+        n_extremos = resumo_rsi["alinhamento"]
+        if n_extremos >= 2:
+            seta = "🟢↓" if resumo_rsi["direcao"] == Direction.BUY.value else "🔴↑"
+            exaustao = f"🎯 {n_extremos} TFs {seta}"
+        elif n_extremos == 1:
+            seta = "↓" if resumo_rsi["direcao"] == Direction.BUY.value else "↑"
+            exaustao = f"1 TF {seta}"
+        else:
+            exaustao = ""
+
         rows.append({
             "Ativo": symbol,
             "Alerta": alerta,
@@ -735,6 +849,10 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             col_a: score_a,
             col_b: score_b,
             "Score Geral": score_geral,
+            f"IFR {tf_a}": rsi_tf,
+            "IFR Diário": rsi_d1,
+            "Zona IFR": rsi_zona,
+            "Exaustão IFR": exaustao,
             "Setup": setup_text,
             "Entrada": round(risk.entry, 2) if risk and risk.entry else None,
             "Stop": round(risk.stop, 2) if risk and risk.stop else None,
@@ -792,7 +910,7 @@ def _persist_watchlist() -> None:
 # ========================================================================
 with st.sidebar:
     st.markdown("## 📊 Day Trade SMC")
-    st.caption("SMC · Price Action · Médias Móveis · VWAP")
+    st.caption("SMC · Price Action · Médias Móveis · VWAP · IFR")
 
     mode = st.radio(
         "Modo",
@@ -801,18 +919,32 @@ with st.sidebar:
     )
 
     st.markdown("### Fonte de dados")
+
+    # Detecta uma vez por sessão se há um terminal MT5 acessível nesta
+    # máquina. Rodando localmente com o MT5 aberto, o padrão passa a
+    # ser MT5 (tempo real) em vez de Yahoo Finance (atrasado ~15-20min).
+    if "mt5_available" not in st.session_state:
+        st.session_state.mt5_available = daytrade_smc.mt5_is_available()
+
+    if st.session_state.mt5_available:
+        st.success("🟢 MetaTrader 5 conectado — dados em tempo real disponíveis.")
+        default_source_index = DATA_SOURCES.index("MetaTrader 5")
+    else:
+        default_source_index = DATA_SOURCES.index("Yahoo Finance")
+
     source = st.radio(
-        "Fonte", DATA_SOURCES, key="source_select", horizontal=True,
-        help="Yahoo Finance funciona em qualquer lugar, com atraso de ~15-20min. MetaTrader 5 "
-             "direto é tempo real, mas só funciona rodando este app na máquina com o MT5 aberto. "
-             "\"GitHub (MT5 de casa)\" funciona de qualquer lugar (inclusive do trabalho) e busca "
-             "dado real do MT5, publicado automaticamente pelo PC de casa a cada poucos minutos.",
+        "Fonte", DATA_SOURCES, key="source_select", horizontal=True, index=default_source_index,
+        help="MetaTrader 5 é tempo real, mas só funciona rodando este app na mesma máquina com o "
+             "MT5 aberto (é o modo recomendado). Yahoo Finance funciona em qualquer lugar, com "
+             "atraso de ~15-20min. \"GitHub (MT5 de casa)\" lê um snapshot publicado por outra "
+             "máquina — só use se estiver acessando de fora.",
     )
-    if source == "MetaTrader 5":
-        st.caption(
-            "⚠️ Só funciona rodando localmente, na máquina com o MT5 aberto. Se você estiver "
-            "vendo isso no Streamlit Cloud, vai dar erro de conexão — o servidor da nuvem não "
-            "tem o MT5 instalado. Veja o README pra rodar local e acessar remoto."
+    if source == "MetaTrader 5" and not st.session_state.mt5_available:
+        st.error(
+            "⚠️ Nenhum terminal MetaTrader 5 acessível neste ambiente. Isso acontece quando o app "
+            "está rodando no Streamlit Cloud (servidor Linux, sem MT5) ou quando o MT5 não está "
+            "aberto/logado nesta máquina. Para tempo real, rode o app localmente com o "
+            "start_app.bat, na mesma máquina do MT5."
         )
     elif source == "GitHub (MT5 de casa)":
         last_update = fetch_snapshot_timestamp()
@@ -862,10 +994,11 @@ with st.sidebar:
     st.markdown("### Modalidade")
     modality = st.selectbox(
         "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
-        help="Confluência combina as 4 categorias. SMC/Price Action/Médias Móveis/VWAP usam só a "
-             "leitura isolada daquela categoria. \"Todas as modalidades\" calcula um SCORE GERAL "
-             "(média das 5 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
-             "e ordenar o Scanner.",
+        help="Confluência combina as 5 categorias. SMC/Price Action/Médias Móveis/VWAP/IFR usam só "
+             "a leitura isolada daquela categoria. \"Todas as modalidades\" calcula um SCORE GERAL "
+             "(média das 6 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
+             "e ordenar o Scanner. O IFR usa o Diário como filtro de contexto: sobrecompra/sobrevenda "
+             "alinhada nos dois prazos reforça o sinal; contrária reduz.",
     )
 
     st.markdown("### Ativos monitorados")
@@ -913,7 +1046,26 @@ with st.sidebar:
              "aparecem na tela pra estudo, mas não são registradas no Histórico de Sinais — evita "
              "misturar sinais fracos com sinais fortes nas estatísticas de acerto.",
     )
+    # Os limiares acompanham o estilo: Day Trade usa extremos verdadeiros
+    # (10/90) porque em M5/M15/H1 o IFR alcança esses níveis com alguma
+    # regularidade; Swing usa 20/80, já que no Diário/Semanal o 90/10 é
+    # raríssimo e quase nunca dispararia. O `key` inclui o estilo pra que
+    # o slider REINICIE nos novos padrões ao trocar de estilo, em vez de
+    # manter o valor do estilo anterior.
+    rsi_os_default, rsi_ob_default = daytrade_smc.STYLE_RSI_THRESHOLDS[style]
+    rsi_ob, rsi_os = st.slider(
+        "Limiares do IFR (sobrevenda / sobrecompra)", min_value=0, max_value=100,
+        value=(int(rsi_os_default), int(rsi_ob_default)), step=5,
+        key=f"rsi_thresholds_{style}",
+        help=f"Padrão para {style}: {rsi_os_default:.0f}/{rsi_ob_default:.0f}. "
+             "Day Trade usa 10/90 (exaustão verdadeira, aplicada em 5, 15 e 60 minutos); "
+             "Swing usa 20/80, porque no Diário/Semanal o IFR raramente chega a 10/90 e "
+             "80/20 já representa exaustão real naquele horizonte. Vale para todos os "
+             "timeframes do estilo escolhido.",
+    )
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
+    daytrade_smc.RSI_OVERSOLD = float(rsi_ob)
+    daytrade_smc.RSI_OVERBOUGHT = float(rsi_os)
 
     if mode == "Análise individual":
         st.markdown("### Atualização")
@@ -943,16 +1095,16 @@ if mode == "Análise individual":
 
     if auto_refresh:
         st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
+        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
     else:
-        render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
+        render_individual_analysis(symbol, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
 
 elif mode == "Scanner (todos os ativos)":
     st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
               f"{count} candles · recomendação exige {conf_a}+{conf_b} concordando")
 
     if run_scanner_clicked:
-        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log)
+        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
         st.session_state.scanner_risk_budget = risk_budget
 
     if "scanner_result" in st.session_state:
@@ -979,7 +1131,7 @@ elif mode == "Scanner (todos os ativos)":
 
         st.markdown("#### Abrir análise completa de um ativo")
         pick = st.selectbox("Ativo", result_df["Ativo"].tolist(), key="scanner_pick_select")
-        if st.button("Ver gráfico e as 5 leituras completas"):
+        if st.button("Ver gráfico e as 6 leituras completas"):
             st.session_state.jump_to_symbol = pick
             st.rerun()
     else:
