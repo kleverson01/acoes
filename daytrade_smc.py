@@ -1388,77 +1388,55 @@ def vwap_signal(context: MarketContext) -> Signal:
 
 def rsi_signal(context: MarketContext) -> Signal:
     """
-    Leitura de IFR por EXTREMOS. Sobrecompra acima de RSI_OVERBOUGHT
-    (padrão 90) e sobrevenda abaixo de RSI_OVERSOLD (padrão 10),
-    aplicada igualmente em todos os timeframes.
+    Leitura de IFR por EXAUSTÃO. Regra única e binária:
 
-    Nesses extremos, estar NA zona já é o sinal — diferente de 70/30,
-    onde o mercado passa boa parte do tempo dentro da faixa durante
-    tendências normais e a permanência ali não significa exaustão. Em
-    90/10 o movimento é raro e representa esgotamento real de um dos
-    lados, então a entrada é a favor da reversão.
+        IFR ≤ RSI_OVERSOLD   (padrão 10)  ->  COMPRA
+        IFR ≥ RSI_OVERBOUGHT (padrão 90)  ->  VENDA
+        qualquer outro valor              ->  NEUTRO
+
+    Não existe faixa intermediária. Uma versão anterior deste código
+    tinha camadas de "aproximando-se do extremo" (~24/76) e "saindo da
+    zona", que geravam sinal fraco fora da exaustão real — isso
+    descaracterizava o indicador, porque exaustão é justamente o
+    evento raro do extremo, não a caminhada até ele. Ou o ativo está
+    exaurido, ou o IFR não tem nada a dizer.
 
     O IFR do timeframe superior (Diário), quando disponível, entra
-    como reforço: extremo simultâneo nos dois prazos é a leitura de
+    como reforço: exaustão simultânea nos dois prazos é a leitura de
     maior convicção que este indicador produz.
     """
     reasons: list[str] = []
     rsi = context.rsi
-    prev = context.rsi_prev
     overbought, oversold = RSI_OVERBOUGHT, RSI_OVERSOLD
-
-    # Faixas intermediárias, proporcionais aos limiares escolhidos:
-    # servem só como "aproximando-se do extremo", com peso bem menor.
-    near_oversold = oversold + (50 - oversold) * 0.35   # ~24 com 10/90
-    near_overbought = overbought - (overbought - 50) * 0.35
 
     if rsi <= oversold:
         direction, score = Direction.BUY, 100.0
-        setup = f"IFR em sobrevenda extrema (≤ {oversold:.0f})"
-        reasons.append(f"IFR em {rsi:.1f} — exaustão vendedora, abaixo do limiar de {oversold:.0f}")
+        setup = f"EXAUSTÃO VENDEDORA — IFR ≤ {oversold:.0f}"
+        reasons.append(f"IFR em {rsi:.1f}, abaixo de {oversold:.0f} — vendedores exauridos, entrada a favor da reversão")
     elif rsi >= overbought:
         direction, score = Direction.SELL, 100.0
-        setup = f"IFR em sobrecompra extrema (≥ {overbought:.0f})"
-        reasons.append(f"IFR em {rsi:.1f} — exaustão compradora, acima do limiar de {overbought:.0f}")
-    elif prev <= oversold < rsi:
-        # Acabou de sair do extremo: reversão já em curso, ainda válida
-        direction, score = Direction.BUY, 75.0
-        setup = "IFR saindo da sobrevenda extrema"
-        reasons.append(f"IFR cruzou de volta acima de {oversold:.0f} ({prev:.1f} → {rsi:.1f})")
-    elif prev >= overbought > rsi:
-        direction, score = Direction.SELL, 75.0
-        setup = "IFR saindo da sobrecompra extrema"
-        reasons.append(f"IFR cruzou de volta abaixo de {overbought:.0f} ({prev:.1f} → {rsi:.1f})")
-    elif rsi <= near_oversold:
-        direction, score = Direction.BUY, 35.0
-        setup = "IFR se aproximando da sobrevenda extrema"
-        reasons.append(f"IFR em {rsi:.1f} — caminhando para o extremo, ainda não chegou a {oversold:.0f}")
-    elif rsi >= near_overbought:
-        direction, score = Direction.SELL, 35.0
-        setup = "IFR se aproximando da sobrecompra extrema"
-        reasons.append(f"IFR em {rsi:.1f} — caminhando para o extremo, ainda não chegou a {overbought:.0f}")
+        setup = f"EXAUSTÃO COMPRADORA — IFR ≥ {overbought:.0f}"
+        reasons.append(f"IFR em {rsi:.1f}, acima de {overbought:.0f} — compradores exauridos, entrada a favor da reversão")
     else:
-        direction, score = Direction.NEUTRAL, 15.0
-        setup = "IFR fora das zonas extremas"
-        reasons.append(f"IFR em {rsi:.1f} — sem extremo ({oversold:.0f}/{overbought:.0f}), sem viés por este indicador")
+        direction, score = Direction.NEUTRAL, 0.0
+        setup = "Sem exaustão"
+        reasons.append(f"IFR em {rsi:.1f} — fora das zonas de exaustão ({oversold:.0f}/{overbought:.0f})")
 
     # --- Reforço pelo timeframe superior (Diário) ---
     if context.higher_rsi is not None and direction != Direction.NEUTRAL:
         d_rsi = context.higher_rsi
         if direction == Direction.BUY:
             if d_rsi <= oversold:
-                score = min(100.0, score * 1.25)
-                reasons.append(f"Diário TAMBÉM em sobrevenda extrema (IFR {d_rsi:.1f}) — convicção máxima")
+                reasons.append(f"Diário TAMBÉM exaurido na venda (IFR {d_rsi:.1f}) — convicção máxima")
             elif d_rsi >= overbought:
                 score *= 0.55
-                reasons.append(f"ATENÇÃO: Diário em sobrecompra extrema (IFR {d_rsi:.1f}) — comprando contra o extremo do diário")
+                reasons.append(f"ATENÇÃO: Diário exaurido na COMPRA (IFR {d_rsi:.1f}) — sinais opostos entre prazos")
         else:  # SELL
             if d_rsi >= overbought:
-                score = min(100.0, score * 1.25)
-                reasons.append(f"Diário TAMBÉM em sobrecompra extrema (IFR {d_rsi:.1f}) — convicção máxima")
+                reasons.append(f"Diário TAMBÉM exaurido na compra (IFR {d_rsi:.1f}) — convicção máxima")
             elif d_rsi <= oversold:
                 score *= 0.55
-                reasons.append(f"ATENÇÃO: Diário em sobrevenda extrema (IFR {d_rsi:.1f}) — vendendo contra o extremo do diário")
+                reasons.append(f"ATENÇÃO: Diário exaurido na VENDA (IFR {d_rsi:.1f}) — sinais opostos entre prazos")
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1472,7 +1450,7 @@ def rsi_signal(context: MarketContext) -> Signal:
         direction,
         score,
         confidence,
-        setup if direction != Direction.NEUTRAL else "Sem setup operável (IFR)",
+        setup,
         reasons,
         market_alerts(context) + ["LEITURA ISOLADA — confirme com outras categorias"],
     )
@@ -1553,7 +1531,7 @@ def confluence_signal(
     elif context.fvg_setup:
         setup = "FVG + Retorno"
     elif any(s.name == "IFR" and s.direction == direction and s.score >= 79 for s in isolated):
-        setup = "Reversão por IFR extremo"
+        setup = "Exaustão de IFR"
     elif event and event.direction == direction:
         setup = "Continuação de tendência (BOS)"
     else:

@@ -652,24 +652,18 @@ def render_rsi_badge(context) -> None:
     rsi = context.rsi
     ob = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
     os_ = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
-    near_os = os_ + (50 - os_) * 0.35
-    near_ob = ob - (ob - 50) * 0.35
 
     if rsi <= os_:
-        zona, cor = f"SOBREVENDA EXTREMA (≤{os_:.0f})", "#2ed3a3"
+        zona, cor = f"EXAUSTÃO VENDEDORA (≤{os_:.0f}) → COMPRA", "#2ed3a3"
     elif rsi >= ob:
-        zona, cor = f"SOBRECOMPRA EXTREMA (≥{ob:.0f})", "#ff5470"
-    elif rsi <= near_os:
-        zona, cor = "Aproximando da sobrevenda", "#f0b429"
-    elif rsi >= near_ob:
-        zona, cor = "Aproximando da sobrecompra", "#f0b429"
+        zona, cor = f"EXAUSTÃO COMPRADORA (≥{ob:.0f}) → VENDA", "#ff5470"
     else:
-        zona, cor = "Fora dos extremos", "#8291a1"
+        zona, cor = "Sem exaustão", "#8291a1"
 
     diario = ""
     if context.higher_rsi is not None:
         d = context.higher_rsi
-        d_zona = "extremo ↓" if d <= os_ else "extremo ↑" if d >= ob else "neutro"
+        d_zona = "exaurido ↓" if d <= os_ else "exaurido ↑" if d >= ob else "sem exaustão"
         diario = f" · <b>Diário:</b> {d:.1f} ({d_zona})"
 
     st.markdown(
