@@ -32,6 +32,7 @@ import re
 import statistics
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -52,15 +53,28 @@ LOCAL_TZ = "America/Sao_Paulo"
 DEFAULT_SYMBOLS = [
     "VALE3",
     "PETR4",
-    "PRIO3",
+    "PETR3",
     "ITUB4",
-    "BBAS3",
     "BBDC4",
+    "BBAS3",
+    "ABEV3",
     "B3SA3",
     "WEGE3",
-    "ABEV3",
-    "MGLU3",
-    "BRA50",
+    "RENT3",
+    "PRIO3",
+    "SUZB3",
+    "JBSS3",
+    "ELET3",
+    "BBSE3",
+    "RADL3",
+    "HAPV3",
+    "VBBR3",
+    "GGBR4",
+    "CMIG4",
+    "EMBR3",
+    "CSNA3",
+    "EQTL3",
+    "LREN3",
 ]
 SYMBOL_ALIASES = {
     "BRA50": "^BVSP",
@@ -75,19 +89,75 @@ SYMBOL_ALIASES = {
     "BTC": "BTC-USD",
     "BITCOIN": "BTC-USD",
 }
+
+# --- WINFUT (mini índice) ---------------------------------------------
+# O mini índice não tem um código único: cada corretora nomeia o
+# contrato contínuo de um jeito, e o contrato "cheio" muda de código a
+# cada vencimento (letra do mês + ano, ex: WINJ26). Por isso o app
+# tenta uma lista de candidatos e usa o primeiro que o terminal
+# reconhecer, em vez de exigir que você acerte o código na mão.
+#
+# Preferimos sempre o CONTÍNUO (WIN$N e variantes): ele emenda os
+# vencimentos automaticamente, então o histórico não quebra na
+# virada do contrato.
+WINFUT_CANDIDATES = ("WIN$N", "WIN$", "WIN$D", "WINFUT", "WIN")
+WINFUT_LABEL = "WINFUT"
+_WINFUT_RESOLVED: str | None = None
+
+
+def resolve_winfut_symbol() -> str | None:
+    """
+    Descobre qual código de mini índice esta corretora usa. Testa os
+    candidatos conhecidos e, se nenhum servir, varre os símbolos que
+    contenham "WIN" — cobrindo contratos com vencimento no nome.
+    O resultado fica em cache: essa busca é cara e o código não muda
+    durante a sessão.
+    """
+    global _WINFUT_RESOLVED
+    if _WINFUT_RESOLVED is not None:
+        return _WINFUT_RESOLVED
+
+    try:
+        mt5 = _ensure_mt5_connection()
+    except Exception:
+        return None
+
+    for nome in WINFUT_CANDIDATES:
+        info = mt5.symbol_info(nome)
+        if info is not None:
+            mt5.symbol_select(nome, True)
+            if _mt5_has_candles(mt5, nome):
+                _WINFUT_RESOLVED = nome
+                return nome
+
+    try:
+        encontrados = mt5.symbols_get("*WIN*") or []
+    except Exception:
+        encontrados = []
+    # Contínuos primeiro (têm "$"), depois os contratos com vencimento
+    for info in sorted(encontrados, key=lambda s: ("$" not in s.name, s.name)):
+        mt5.symbol_select(info.name, True)
+        if _mt5_has_candles(mt5, info.name):
+            _WINFUT_RESOLVED = info.name
+            return info.name
+    return None
+
+
+def _mt5_has_candles(mt5, symbol: str) -> bool:
+    try:
+        r = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 5)
+        return r is not None and len(r) > 0
+    except Exception:
+        return False
+
 TIMEFRAMES = {
-    "M2": {
-        # Suporte limitado no Yahoo (poucos dias de histórico) — pensado
-        # sobretudo pra fonte MT5, mais adequada a candles tão curtos.
-        "interval": "2m",
-        "duration": pd.Timedelta(minutes=2),
-        "candles_day": 195,
-        "max_days": 60,
-    },
     "M5": {
         "interval": "5m",
         "duration": pd.Timedelta(minutes=5),
         "candles_day": 78,
+        # O Yahoo Finance só entrega intervalos de 5min dos últimos 60
+        # dias; via MT5 o limite é bem maior, mas 60 cobre com folga o
+        # que este timeframe é usado aqui (gatilho de entrada intradiário).
         "max_days": 60,
     },
     "M15": {
@@ -128,7 +198,7 @@ TIMEFRAMES = {
 # Day Trade: confirmação em M15+H1 (posições fechadas no mesmo dia).
 # H4 e Diário entram como contexto de tendência mais ampla.
 DAYTRADE_CONFIRMATION_TIMEFRAMES = ("M15", "H1")
-DAYTRADE_CONTEXT_TIMEFRAMES = ("H4", "D1")
+DAYTRADE_CONTEXT_TIMEFRAMES = ("M5", "H4", "D1")
 
 # Swing Trade: confirmação em Diário+Semanal (posições de dias a semanas).
 # H4 entra como contexto pra afinar o timing de entrada dentro da
@@ -136,13 +206,12 @@ DAYTRADE_CONTEXT_TIMEFRAMES = ("H4", "D1")
 SWING_CONFIRMATION_TIMEFRAMES = ("D1", "W1")
 SWING_CONTEXT_TIMEFRAMES = ("H4",)
 
-# Mini Índice (WINFUT) — aba dedicada, totalmente separada da watchlist
-# de ações. Contrato futuro, muito mais rápido que uma ação: confirmação
-# em M5+M15, com M2 (timing fino de entrada) e H1 (contexto da sessão)
-# como referência adicional.
-WINFUT_SYMBOL = "WINFUT"
+# WINFUT: o mini índice é operado quase só intradiário e tem
+# volatilidade bem maior que as ações, então usa um recorte próprio —
+# M5 entra como confirmação (não só contexto), e o Diário fica de fora
+# do peso da decisão, servindo apenas como pano de fundo.
 WINFUT_CONFIRMATION_TIMEFRAMES = ("M5", "M15")
-WINFUT_CONTEXT_TIMEFRAMES = ("M2", "H1")
+WINFUT_CONTEXT_TIMEFRAMES = ("H1", "D1")
 
 # Mantidos por compatibilidade — apontam pro conjunto de Day Trade, que
 # é o comportamento padrão histórico deste motor.
@@ -195,8 +264,13 @@ class MarketContext:
     bullish_retest: bool
     bearish_retest: bool
     fvg_setup: str | None
-    rsi: float
-    rsi_series: pd.Series
+    rsi: float = 50.0
+    rsi_prev: float = 50.0
+    rsi_series: pd.Series | None = None
+    # IFR do timeframe superior (Diário), injetado pelo multi-timeframe.
+    # None quando não disponível — a leitura de IFR então opera só com
+    # o timeframe atual, sem o filtro de contexto.
+    higher_rsi: float | None = None
 
 
 @dataclass
@@ -294,7 +368,41 @@ DATA_SOURCES = ("Yahoo Finance", "MetaTrader 5", "GitHub (MT5 de casa)")
 GITHUB_BRIDGE_REPO: str | None = None
 GITHUB_BRIDGE_TOKEN: str | None = None
 
-_MT5_TIMEFRAME_MAP_NAMES = {"M2": "TIMEFRAME_M2", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1"}
+# Piso mínimo da distância do stop, em múltiplos do ATR do timeframe.
+# Mesmo padrão de configuração acima: variável de módulo, ajustável
+# pela interface (barra lateral) sem precisar editar código. Valor
+# baixo (ex: 0.75) deixa o stop mais apertado — mais operações, porém
+# mais vulnerável a ser tocado só por ruído normal do candle seguinte,
+# especialmente em ativos de baixa volatilidade no M15. Valor mais
+# alto (ex: 1.25-1.5) reduz esse "stop por ruído", ao custo de um
+# risco por operação maior.
+MIN_STOP_ATR_MULT: float = 1.0
+
+# Limiares do IFR para sobrecompra / sobrevenda. O padrão aqui é
+# 90/10 (extremos verdadeiros), não os convencionais 70/30.
+#
+# A diferença é de natureza, não só de grau: 70/30 é atingido com
+# frequência dentro de tendências normais — por isso, ali, o gatilho
+# confiável seria a SAÍDA da zona, não a permanência nela. Já 90/10
+# marca exaustão genuína e rara, em que a própria permanência na zona
+# já é o sinal. Muito menos sinais, porém bem mais seletivos.
+#
+# Ajustáveis pela barra lateral do app, sem precisar editar código.
+RSI_OVERBOUGHT: float = 90.0
+RSI_OVERSOLD: float = 10.0
+
+# Limiares de IFR por estilo de operação. A diferença existe porque o
+# ruído muda de escala com o timeframe: em M5/M15 o IFR bate 90/10 com
+# alguma regularidade, então só o extremo verdadeiro filtra bem. Já no
+# Diário/Semanal, 90/10 é raríssimo — quase nunca dispararia — e 80/20
+# já representa exaustão genuína naquele horizonte.
+STYLE_RSI_THRESHOLDS = {
+    "Day Trade": (10.0, 90.0),
+    "Swing Trade": (20.0, 80.0),
+    "WINFUT": (10.0, 90.0),
+}
+
+_MT5_TIMEFRAME_MAP_NAMES = {"M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1"}
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, count: int, source: str = "Yahoo Finance") -> pd.DataFrame:
@@ -334,7 +442,7 @@ def _fetch_ohlcv_github(symbol: str, timeframe: str, count: int) -> pd.DataFrame
             "st.secrets['github_repo'] no formato 'usuario/nome-do-repositorio'."
         )
 
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/HEAD/data/mt5_snapshot.json"
+    url = _bust_cache_url(f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json")
     headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
 
     try:
@@ -371,13 +479,24 @@ def _fetch_ohlcv_github(symbol: str, timeframe: str, count: int) -> pd.DataFrame
     return df[["open", "high", "low", "close", "volume"]].tail(count)
 
 
+def _bust_cache_url(url: str) -> str:
+    """
+    Acrescenta um parâmetro que muda a cada chamada, pra evitar que o
+    CDN do GitHub (raw.githubusercontent.com) devolva uma cópia em
+    cache do arquivo — sem isso, a "Última atualização" pode ficar
+    presa numa versão antiga por vários minutos mesmo depois de um
+    push novo.
+    """
+    return f"{url}?_cb={int(time.time() * 1000)}"
+
+
 def fetch_snapshot_timestamp() -> str | None:
     """Devolve o horário (ISO, UTC) do snapshot mais recente publicado no GitHub, ou None se não houver nenhum ainda."""
     import requests
 
     if not GITHUB_BRIDGE_REPO:
         return None
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/HEAD/data/mt5_snapshot.json"
+    url = _bust_cache_url(f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json")
     headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
     try:
         response = requests.get(url, headers=headers, timeout=10)
@@ -388,37 +507,74 @@ def fetch_snapshot_timestamp() -> str | None:
         return None
 
 
-def trigger_github_update() -> tuple[bool, str]:
+def request_mt5_update() -> tuple[bool, str]:
     """
-    Dispara o workflow do GitHub Actions (workflow_dispatch) que aciona
-    o runner no PC de casa. Devolve (sucesso, mensagem).
+    Grava um "pedido de atualização" direto no repositório (só um
+    arquivo pequeno com o horário do pedido) — SEM usar GitHub
+    Actions. Um script "vigia" rodando no PC de casa fica checando
+    esse arquivo a cada poucos segundos e, ao notar um pedido novo,
+    busca os dados no MT5 e publica. Devolve (sucesso, mensagem).
     """
+    import base64
     import requests
 
     if not GITHUB_BRIDGE_REPO or not GITHUB_BRIDGE_TOKEN:
         return False, "Repositório ou token do GitHub não configurados (veja st.secrets)."
 
-    url = f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}/actions/workflows/mt5-update.yml/dispatches"
+    path = "data/update_request.json"
+    url = f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}/contents/{path}"
     headers = {
         "Authorization": f"token {GITHUB_BRIDGE_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
+
+    # A API de "contents" do GitHub exige o SHA atual do arquivo pra
+    # poder sobrescrever (se ele já existir); se ainda não existir,
+    # não precisa de SHA — ela cria um arquivo novo.
+    sha = None
     try:
-        response = requests.post(url, headers=headers, json={"ref": "main"}, timeout=15)
+        get_response = requests.get(url, headers=headers, timeout=15)
+        if get_response.status_code == 200:
+            sha = get_response.json().get("sha")
+        elif get_response.status_code not in (200, 404):
+            return False, f"Falha ao consultar o arquivo de pedido (HTTP {get_response.status_code})."
     except Exception as exc:
-        return False, f"Falha ao chamar a API do GitHub: {exc}"
+        return False, f"Falha ao consultar o repositório: {exc}"
 
-    if response.status_code == 204:
-        return True, "Atualização disparada — aguardando o PC de casa processar."
-    if response.status_code == 404:
-        return False, (
-            "Workflow não encontrado (HTTP 404). Confirme se o arquivo "
-            ".github/workflows/mt5-update.yml foi commitado e se o token tem permissão 'workflow'."
-        )
-    return False, f"Falha ao disparar (HTTP {response.status_code}): {response.text[:200]}"
+    now_iso = pd.Timestamp.now(tz="UTC").isoformat()
+    content_json = json.dumps({"requested_at": now_iso}, ensure_ascii=False)
+    payload = {
+        "message": f"Pedido de atualizacao via MT5 - {now_iso}",
+        "content": base64.b64encode(content_json.encode("utf-8")).decode("ascii"),
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        put_response = requests.put(url, headers=headers, json=payload, timeout=15)
+    except Exception as exc:
+        return False, f"Falha ao gravar o pedido no GitHub: {exc}"
+
+    if put_response.status_code in (200, 201):
+        return True, "Pedido enviado — aguardando o PC de casa processar."
+    return False, f"Falha ao gravar o pedido (HTTP {put_response.status_code}): {put_response.text[:200]}"
 
 
-def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+_MT5_INITIALIZED = False
+_MT5_LOCK = threading.Lock()
+
+
+def _ensure_mt5_connection():
+    """
+    Conecta ao terminal MT5 UMA vez por processo e mantém a conexão
+    aberta. Antes, cada busca fazia initialize()+shutdown() — numa
+    varredura de 24 ativos × 5 timeframes isso significava 120 ciclos
+    de conexão/desconexão, o que é lento e causa falhas intermitentes
+    (a conexão anterior ainda está fechando quando a próxima tenta
+    abrir). Devolve o módulo `MetaTrader5` já conectado.
+    """
+    global _MT5_INITIALIZED
+
     try:
         import MetaTrader5 as mt5
     except ImportError as exc:
@@ -428,29 +584,52 @@ def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
             "no Streamlit Cloud. Rode `pip install MetaTrader5` na máquina onde o MT5 está aberto."
         ) from exc
 
+    with _MT5_LOCK:
+        if not _MT5_INITIALIZED:
+            if not mt5.initialize():
+                raise RuntimeError(
+                    f"Não foi possível conectar ao terminal MetaTrader 5 ({mt5.last_error()}). "
+                    "Confirme que o MT5 está aberto e logado nesta máquina."
+                )
+            _MT5_INITIALIZED = True
+    return mt5
+
+
+def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+    mt5 = _ensure_mt5_connection()
+
     if timeframe not in _MT5_TIMEFRAME_MAP_NAMES:
         raise ValueError(f"Timeframe {timeframe} não é suportado via MT5.")
     mt5_timeframe = getattr(mt5, _MT5_TIMEFRAME_MAP_NAMES[timeframe])
 
-    if not mt5.initialize():
-        error = mt5.last_error()
+    # "WINFUT" é um apelido: o código real varia por corretora e por
+    # vencimento, então resolvemos na hora (com cache).
+    if symbol.upper() in (WINFUT_LABEL, "WIN", "MINI-INDICE", "MINI ÍNDICE"):
+        resolvido = resolve_winfut_symbol()
+        if resolvido is None:
+            raise RuntimeError(
+                "Nenhum contrato de mini índice (WINFUT) encontrado nesta conta MT5. "
+                "Rode `python diagnostico_mt5.py` para ver quais códigos a sua corretora "
+                "disponibiliza."
+            )
+        symbol = resolvido
+
+    if not mt5.symbol_select(symbol, True):
         raise RuntimeError(
-            f"Não foi possível conectar ao terminal MetaTrader 5 ({error}). Confirme que o MT5 "
-            "está aberto e logado nesta máquina."
+            f"Ativo '{symbol}' não foi encontrado no MT5. Confirme o código exato usado pela "
+            "sua corretora (às vezes tem sufixo, ex: PETR4F)."
         )
 
-    try:
-        if not mt5.symbol_select(symbol, True):
-            raise RuntimeError(
-                f"Ativo '{symbol}' não foi encontrado no MT5. Confirme o código exato usado pela "
-                "sua corretora (às vezes tem sufixo, ex: PETR4F)."
-            )
-
+    # Uma nova tentativa cobre o caso do símbolo ter acabado de ser
+    # adicionado ao Market Watch pelo symbol_select acima — o terminal
+    # às vezes ainda não tem o histórico carregado na primeira chamada.
+    rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        time.sleep(0.4)
         rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count)
-        if rates is None or len(rates) == 0:
-            raise RuntimeError(f"MT5 não devolveu candles para {symbol} em {timeframe} ({mt5.last_error()}).")
-    finally:
-        mt5.shutdown()
+
+    if rates is None or len(rates) == 0:
+        raise RuntimeError(f"MT5 não devolveu candles para {symbol} em {timeframe} ({mt5.last_error()}).")
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
@@ -463,6 +642,20 @@ def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         raise RuntimeError(f"Resposta do MT5 sem colunas obrigatórias: {missing}")
 
     return df[["open", "high", "low", "close", "volume"]].tail(count)
+
+
+def mt5_is_available() -> bool:
+    """
+    Diz se este processo consegue falar com um terminal MT5 aberto
+    nesta máquina. Usado pra escolher automaticamente a melhor fonte
+    de dados na abertura do app: rodando localmente com o MT5 ligado,
+    não faz sentido cair no Yahoo Finance (atrasado) por padrão.
+    """
+    try:
+        _ensure_mt5_connection()
+        return True
+    except Exception:
+        return False
 
 
 def _fetch_ohlcv_yahoo(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
@@ -535,6 +728,16 @@ def _fetch_ohlcv_yahoo(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
 
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    ATR pelo método de Wilder — mesma convenção do MetaTrader e do
+    TradingView (que chamam esse suavizamento de SMMA/RMA).
+
+    Uma versão anterior usava média SIMPLES do True Range
+    (`rolling().mean()`), o que dava divergência de 2-5% contra o ATR
+    das plataformas. Como o ATR define a distância mínima do stop
+    (ver `attach_risk`), essa diferença ia direto pro tamanho do risco
+    de cada operação — por isso vale a consistência.
+    """
     previous_close = df["close"].shift(1)
     true_range = pd.concat(
         [
@@ -544,7 +747,73 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         ],
         axis=1,
     ).max(axis=1)
-    return true_range.rolling(period, min_periods=period).mean().bfill()
+
+    if len(true_range) <= period:
+        return true_range.rolling(period, min_periods=1).mean().bfill()
+
+    # Mesma semente do IFR: média simples dos `period` primeiros
+    # valores, depois suavizamento de Wilder.
+    seeded = true_range.copy()
+    seeded.iloc[:period] = np.nan
+    seeded.iloc[period] = true_range.iloc[1:period + 1].mean()
+    return seeded.ewm(alpha=1 / period, adjust=False).mean().bfill()
+
+
+def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    IFR (Índice de Força Relativa / RSI) pelo método de Wilder — o
+    mesmo usado por padrão no MetaTrader, TradingView e Profit, pra
+    que o número aqui bata com o que você vê no gráfico.
+
+    Detalhe que faz TODA a diferença e é a fonte de erro mais comum
+    nas implementações: a SEMENTE do cálculo. Wilder inicia com a
+    média SIMPLES dos primeiros `period` ganhos/perdas e só a partir
+    daí aplica o suavizamento (avg = (avg_anterior*(n-1) + atual)/n).
+
+    Usar `ewm(adjust=False)` direto sobre a série inteira — como uma
+    versão anterior deste código fazia — semeia o cálculo com o
+    primeiro ganho isolado em vez dessa média, gerando divergência de
+    até ~20 pontos contra o valor real, que decai lentamente ao longo
+    da série. Validado contra os dados de referência do próprio Wilder.
+    """
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+
+    # Semente de Wilder: média simples dos `period` primeiros valores,
+    # posicionada no índice `period`. Tudo antes vira NaN (período de
+    # aquecimento). O ewm começa a partir do primeiro valor não-nulo,
+    # então daqui pra frente ele reproduz exatamente o suavizamento
+    # de Wilder.
+    if len(delta) <= period:
+        return pd.Series(np.nan, index=df.index)
+
+    gain_seeded = gain.copy()
+    loss_seeded = loss.copy()
+    gain_seeded.iloc[:period] = np.nan
+    loss_seeded.iloc[:period] = np.nan
+    gain_seeded.iloc[period] = gain.iloc[1:period + 1].mean()
+    loss_seeded.iloc[period] = loss.iloc[1:period + 1].mean()
+
+    avg_gain = gain_seeded.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss_seeded.ewm(alpha=1 / period, adjust=False).mean()
+
+    rsi = pd.Series(np.nan, index=df.index, dtype=float)
+    valid = avg_gain.notna() & avg_loss.notna()
+
+    # Três casos, tratados explicitamente pra evitar divisão por zero:
+    #   perda 0 e ganho > 0  -> alta sem nenhuma queda: IFR = 100
+    #   perda 0 e ganho 0    -> mercado parado: IFR = 50 (neutro, não 100)
+    #   caso normal          -> fórmula padrão
+    sem_perda = valid & (avg_loss == 0)
+    rsi[sem_perda & (avg_gain > 0)] = 100.0
+    rsi[sem_perda & (avg_gain == 0)] = 50.0
+
+    normal = valid & (avg_loss > 0)
+    rs = avg_gain[normal] / avg_loss[normal]
+    rsi[normal] = 100 - (100 / (1 + rs))
+
+    return rsi
 
 
 def compute_emas(df: pd.DataFrame) -> pd.DataFrame:
@@ -817,18 +1086,7 @@ def detect_fvg_setup(df: pd.DataFrame, max_age: int = 20) -> str | None:
     return None
 
 
-def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """IFR/RSI clássico (suavização de Wilder, período 14)."""
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, 1e-10)
-    return 100 - (100 / (1 + rs))
-
-
-def build_context(df: pd.DataFrame) -> MarketContext:
+def build_context(df: pd.DataFrame, higher_rsi: float | None = None) -> MarketContext:
     if len(df) < 30:
         raise ValueError("São necessários pelo menos 30 candles fechados.")
 
@@ -861,8 +1119,11 @@ def build_context(df: pd.DataFrame) -> MarketContext:
     swings = detect_swings(df)
     events = detect_structure(df, swings, atr_series)
     broke_high, broke_low, bullish_retest, bearish_retest = breakout_and_retest(df, atr)
+
     rsi_series = compute_rsi(df)
-    rsi = float(rsi_series.iloc[-1]) if pd.notna(rsi_series.iloc[-1]) else 50.0
+    rsi_clean = rsi_series.dropna()
+    rsi_now = float(rsi_clean.iloc[-1]) if len(rsi_clean) >= 1 else 50.0
+    rsi_before = float(rsi_clean.iloc[-2]) if len(rsi_clean) >= 2 else rsi_now
 
     return MarketContext(
         df=df,
@@ -885,8 +1146,10 @@ def build_context(df: pd.DataFrame) -> MarketContext:
         bullish_retest=bullish_retest,
         bearish_retest=bearish_retest,
         fvg_setup=detect_fvg_setup(df),
-        rsi=rsi,
+        rsi=rsi_now,
+        rsi_prev=rsi_before,
         rsi_series=rsi_series,
+        higher_rsi=higher_rsi,
     )
 
 
@@ -1204,45 +1467,71 @@ def vwap_signal(context: MarketContext) -> Signal:
     )
 
 
-def ifr_signal(context: MarketContext, oversold: float = 20.0, overbought: float = 80.0) -> Signal:
+def rsi_signal(context: MarketContext) -> Signal:
     """
-    IFR/RSI como leitura de exaustão: ficar DENTRO da zona extrema já é
-    o sinal — não espera o IFR SAIR da zona pra confirmar. IFR muito
-    baixo = exaustão vendedora (viés de compra); IFR muito alto =
-    exaustão compradora (viés de venda). Quanto mais fundo na zona,
-    maior o score — é uma leitura contrária por natureza, pensada pra
-    capturar reversões de curto prazo, não seguir tendência.
+    Leitura de IFR por EXAUSTÃO. Regra única e binária:
+
+        IFR ≤ RSI_OVERSOLD   (padrão 10)  ->  COMPRA
+        IFR ≥ RSI_OVERBOUGHT (padrão 90)  ->  VENDA
+        qualquer outro valor              ->  NEUTRO
+
+    Não existe faixa intermediária. Uma versão anterior deste código
+    tinha camadas de "aproximando-se do extremo" (~24/76) e "saindo da
+    zona", que geravam sinal fraco fora da exaustão real — isso
+    descaracterizava o indicador, porque exaustão é justamente o
+    evento raro do extremo, não a caminhada até ele. Ou o ativo está
+    exaurido, ou o IFR não tem nada a dizer.
+
+    O IFR do timeframe superior (Diário), quando disponível, entra
+    como reforço: exaustão simultânea nos dois prazos é a leitura de
+    maior convicção que este indicador produz.
     """
     reasons: list[str] = []
     rsi = context.rsi
+    overbought, oversold = RSI_OVERBOUGHT, RSI_OVERSOLD
 
     if rsi <= oversold:
-        depth = (oversold - rsi) / oversold if oversold > 0 else 0.0
-        direction = Direction.BUY
-        score = 60.0 + min(depth, 1.0) * 40.0
-        setup = f"IFR em exaustão vendedora ({rsi:.1f} ≤ {oversold:.0f})"
-        reasons.append(f"IFR(14) em {rsi:.1f}, dentro da zona de sobrevenda (≤{oversold:.0f})")
+        direction, score = Direction.BUY, 100.0
+        setup = f"EXAUSTÃO VENDEDORA — IFR ≤ {oversold:.0f}"
+        reasons.append(f"IFR em {rsi:.1f}, abaixo de {oversold:.0f} — vendedores exauridos, entrada a favor da reversão")
     elif rsi >= overbought:
-        depth = (rsi - overbought) / (100 - overbought) if overbought < 100 else 0.0
-        direction = Direction.SELL
-        score = 60.0 + min(depth, 1.0) * 40.0
-        setup = f"IFR em exaustão compradora ({rsi:.1f} ≥ {overbought:.0f})"
-        reasons.append(f"IFR(14) em {rsi:.1f}, dentro da zona de sobrecompra (≥{overbought:.0f})")
+        direction, score = Direction.SELL, 100.0
+        setup = f"EXAUSTÃO COMPRADORA — IFR ≥ {overbought:.0f}"
+        reasons.append(f"IFR em {rsi:.1f}, acima de {overbought:.0f} — compradores exauridos, entrada a favor da reversão")
     else:
-        direction = Direction.NEUTRAL
-        score = 15.0
-        setup = "Sem setup claro (IFR)"
-        reasons.append(f"IFR(14) em {rsi:.1f}, fora das zonas extremas ({oversold:.0f}/{overbought:.0f})")
+        direction, score = Direction.NEUTRAL, 0.0
+        setup = "Sem exaustão"
+        reasons.append(f"IFR em {rsi:.1f} — fora das zonas de exaustão ({oversold:.0f}/{overbought:.0f})")
+
+    # --- Reforço pelo timeframe superior (Diário) ---
+    if context.higher_rsi is not None and direction != Direction.NEUTRAL:
+        d_rsi = context.higher_rsi
+        if direction == Direction.BUY:
+            if d_rsi <= oversold:
+                reasons.append(f"Diário TAMBÉM exaurido na venda (IFR {d_rsi:.1f}) — convicção máxima")
+            elif d_rsi >= overbought:
+                score *= 0.55
+                reasons.append(f"ATENÇÃO: Diário exaurido na COMPRA (IFR {d_rsi:.1f}) — sinais opostos entre prazos")
+        else:  # SELL
+            if d_rsi >= overbought:
+                reasons.append(f"Diário TAMBÉM exaurido na compra (IFR {d_rsi:.1f}) — convicção máxima")
+            elif d_rsi <= oversold:
+                score *= 0.55
+                reasons.append(f"ATENÇÃO: Diário exaurido na VENDA (IFR {d_rsi:.1f}) — sinais opostos entre prazos")
 
     direction, score, confidence = apply_market_filter(
-        direction, score, score * 0.75, context, isolated=True,
+        direction,
+        score,
+        score * 0.7,
+        context,
+        isolated=True,
     )
     return Signal(
         "IFR",
         direction,
         score,
         confidence,
-        setup if direction != Direction.NEUTRAL else "Sem setup operável (IFR)",
+        setup,
         reasons,
         market_alerts(context) + ["LEITURA ISOLADA — confirme com outras categorias"],
     )
@@ -1252,11 +1541,16 @@ def confluence_signal(
     context: MarketContext,
     isolated: list[Signal],
 ) -> Signal:
+    # Pesos rebalanceados com a entrada do IFR como 5ª categoria. SMC
+    # segue como leitura de maior peso (estrutura manda); o IFR entra
+    # com peso menor que as demais de propósito — é excelente como
+    # GATILHO de timing, mas sozinho não define direção de mercado.
     weights = {
-        "SMC": 30.0,
-        "Price Action": 20.0,
-        "Médias Móveis": 20.0,
-        "VWAP": 20.0,
+        "SMC": 26.0,
+        "Price Action": 18.0,
+        "Médias Móveis": 18.0,
+        "VWAP": 18.0,
+        "IFR": 15.0,
     }
     buy = 0.0
     sell = 0.0
@@ -1286,16 +1580,14 @@ def confluence_signal(
         direction, score = Direction.SELL, sell
 
     agreeing = sum(signal.direction == direction for signal in isolated)
-    # O multiplicador de "2 categorias concordando" foi recalibrado de 0.85
-    # para 0.95: com 0.85, o teto matemático desse cenário (quando só
-    # Médias+VWAP concordam, por exemplo) ficava a poucos pontos do corte
-    # de operabilidade (40) — na prática, quase nenhum sinal real de 2
-    # categorias conseguia passar, mesmo com concordância forte. 0.95 dá
-    # margem real sem abrir mão do critério (ainda exige concordância
-    # genuína e pontuação consistente das 2 categorias).
-    multiplier = {0: 0.60, 1: 0.60, 2: 0.95, 3: 1.0, 4: 1.10}[agreeing]
+    # Multiplicador por número de categorias concordando. Recalibrado
+    # para 5 categorias (entrada do IFR): antes o teto era 4 e o valor
+    # 1.10 premiava a unanimidade. Mantida a mesma filosofia — 2
+    # categorias em 0.95 dá margem real sem abrir mão do critério, e a
+    # unanimidade das 5 recebe o prêmio máximo.
+    multiplier = {0: 0.60, 1: 0.60, 2: 0.90, 3: 1.0, 4: 1.08, 5: 1.15}[agreeing]
     score = min(100.0, score * multiplier)
-    confidence = agreeing / 4 * 100
+    confidence = agreeing / len(isolated) * 100 if isolated else 0.0
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1319,6 +1611,8 @@ def confluence_signal(
         setup = "Pullback na VWAP"
     elif context.fvg_setup:
         setup = "FVG + Retorno"
+    elif any(s.name == "IFR" and s.direction == direction and s.score >= 79 for s in isolated):
+        setup = "Exaustão de IFR"
     elif event and event.direction == direction:
         setup = "Continuação de tendência (BOS)"
     else:
@@ -1327,7 +1621,6 @@ def confluence_signal(
     alerts = market_alerts(context)
     if agreeing < 3:
         alerts.append("SINAIS CONFLITANTES — baixa confluência")
-
     return Signal(
         "Confluência",
         direction,
@@ -1387,13 +1680,6 @@ def stop_for_signal(
             return base - context.atr * 0.3, "EMA21/EMA50"
         base = float(ema["ema_21"] if ema["ema_21"] > price else ema["ema_50"])
         return base + context.atr * 0.3, "EMA21/EMA50"
-
-    if signal.name == "IFR":
-        # IFR não tem nível de preço próprio (é leitura de momentum, não
-        # de estrutura) — usa ATR puro, igual ao fallback genérico.
-        if direction == Direction.BUY:
-            return price - context.atr * 1.2, "ATR"
-        return price + context.atr * 1.2, "ATR"
 
     if direction == Direction.BUY:
         return context.vwap - context.atr * 0.5, "VWAP"
@@ -1495,19 +1781,12 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
 
     entry = round_tick(float(context.df["close"].iloc[-1]), "nearest")
     stop, basis = stop_for_signal(signal, context)
-    # 1.2x ATR, não 0.75x: o ATR é uma MÉDIA de amplitude — um stop a
-    # menos de 1 ATR de distância já fica abaixo da amplitude média de
-    # um único candle, ou seja, boa parte dos candles (mesmo sem
-    # reversão nenhuma) já teria amplitude suficiente pra tocar nele.
-    # 1.2x dá margem real pra separar "ruído normal" de "invalidação
-    # de verdade" — é o mesmo padrão usado no motor multi-timeframe
-    # deste projeto desde o início.
-    minimum_distance = context.atr * 1.2
+    minimum_distance = context.atr * MIN_STOP_ATR_MULT
 
     if signal.direction == Direction.BUY:
         if entry - stop < minimum_distance:
             stop = entry - minimum_distance
-            basis += "+mínimo_0.75ATR"
+            basis += f"+mínimo_{MIN_STOP_ATR_MULT:.2f}ATR"
         stop = round_tick(stop, "floor")
         risk = entry - stop
         if risk <= 0:
@@ -1518,7 +1797,7 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
     else:
         if stop - entry < minimum_distance:
             stop = entry + minimum_distance
-            basis += "+mínimo_0.75ATR"
+            basis += f"+mínimo_{MIN_STOP_ATR_MULT:.2f}ATR"
         stop = round_tick(stop, "ceil")
         risk = stop - entry
         if risk <= 0:
@@ -1558,17 +1837,17 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         )
 
 
-def analyze(df: pd.DataFrame, rsi_thresholds: tuple[float, float] = (10.0, 90.0)) -> tuple[MarketContext, list[Signal]]:
-    context = build_context(df)
+def analyze(df: pd.DataFrame, higher_rsi: float | None = None) -> tuple[MarketContext, list[Signal]]:
+    context = build_context(df, higher_rsi=higher_rsi)
     isolated = [
         smc_signal(context),
         price_action_signal(context),
         moving_average_signal(context),
         vwap_signal(context),
+        rsi_signal(context),
     ]
     confluence = confluence_signal(context, isolated)
-    ifr = ifr_signal(context, oversold=rsi_thresholds[0], overbought=rsi_thresholds[1])
-    signals = [confluence, *isolated, ifr]
+    signals = [confluence, *isolated]
 
     for signal in signals:
         attach_risk(signal, context)
@@ -1591,6 +1870,58 @@ class MultiTimeframeResult:
     modality: str                  # qual leitura foi usada pra confirmação: Confluência, SMC, Price Action, Médias Móveis ou VWAP
     confirmed: bool               # True só se os dois timeframes de confirmação concordarem na mesma direção (nessa leitura)
     confirmed_direction: Direction
+
+
+def rsi_extremes_across_timeframes(mtf: "MultiTimeframeResult") -> dict:
+    """
+    Consolida a leitura de IFR de todos os timeframes analisados e diz
+    onde há extremo. Em Day Trade isso cobre M5, M15 e H1 (mais H4/D1
+    como contexto); em Swing, D1/W1/H4.
+
+    Devolve um dicionário com:
+      - `por_tf`: {timeframe: (valor_ifr, "COMPRA"/"VENDA"/None)}
+      - `extremos_compra` / `extremos_venda`: listas de timeframes
+      - `alinhamento`: quantos timeframes estão em extremo na MESMA
+        direção (0 se não houver nenhum)
+      - `direcao`: direção do alinhamento, ou None
+
+    O `alinhamento` é o filtro forte: dois ou mais timeframes em
+    exaustão simultânea na mesma direção é bem mais raro — e mais
+    significativo — do que um isolado.
+    """
+    por_tf: dict[str, tuple[float, str | None]] = {}
+    compra: list[str] = []
+    venda: list[str] = []
+
+    for tf, resultado in mtf.results.items():
+        if resultado.context is None:
+            continue
+        valor = resultado.context.rsi
+        if valor <= RSI_OVERSOLD:
+            por_tf[tf] = (valor, Direction.BUY.value)
+            compra.append(tf)
+        elif valor >= RSI_OVERBOUGHT:
+            por_tf[tf] = (valor, Direction.SELL.value)
+            venda.append(tf)
+        else:
+            por_tf[tf] = (valor, None)
+
+    if len(compra) > len(venda):
+        alinhamento, direcao = len(compra), Direction.BUY.value
+    elif len(venda) > len(compra):
+        alinhamento, direcao = len(venda), Direction.SELL.value
+    else:
+        # Empate (inclusive 0 x 0) não configura alinhamento — se há
+        # extremos opostos em timeframes diferentes, o sinal se anula.
+        alinhamento, direcao = 0, None
+
+    return {
+        "por_tf": por_tf,
+        "extremos_compra": compra,
+        "extremos_venda": venda,
+        "alinhamento": alinhamento,
+        "direcao": direcao,
+    }
 
 
 MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR")
@@ -1654,7 +1985,7 @@ def _signal_score(signals: list[Signal] | None, modality: str = "Confluência") 
     return sig.score if sig else None
 
 
-DEFAULT_TF_COUNTS = {"M2": 300, "M5": 300, "M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 150}
+DEFAULT_TF_COUNTS = {"M5": 250, "M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 150}
 
 
 @dataclass
@@ -1768,6 +2099,171 @@ def check_signal_as_of(
     )
 
 
+# ========================================================================
+# Histórico de sinais — registra cada recomendação CONFIRMADA (com o
+# horário exato em que apareceu) e depois confere sozinho, com dados
+# reais buscados a partir daquele horário, se o preço já bateu o Alvo
+# 1, o Alvo 2 ou o Stop. É a versão "ao vivo" da Verificação
+# retroativa: lá você escolhe uma data passada pra testar; aqui o
+# sistema grava o sinal no momento em que ele aparece e confere
+# sozinho conforme o tempo passa.
+# ========================================================================
+
+SIGNAL_LOG_OPEN_STATUS = "ABERTO"
+SIGNAL_LOG_TERMINAL_STATUSES = ("ALVO_1", "ALVO_2", "STOP")
+
+
+def signal_log_file() -> Path:
+    """Arquivo local com o histórico de recomendações registradas."""
+    return Path(__file__).resolve().with_name("daytrade_signal_log.json")
+
+
+def load_signal_log() -> list[dict]:
+    path = signal_log_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def save_signal_log(entries: list[dict]) -> None:
+    path = signal_log_file()
+    path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def log_signal(
+    symbol: str,
+    timeframe: str,
+    style: str,
+    modality: str,
+    source: str,
+    signal: Signal,
+) -> dict | None:
+    """
+    Registra uma recomendação operável no histórico, com o horário
+    exato de agora. Só cria uma entrada nova se não houver outra
+    idêntica (mesmo ativo, timeframe, estilo, leitura e direção) ainda
+    em aberto — evita duplicar o mesmo sinal a cada atualização
+    automática ou re-render da tela. Devolve a entrada criada, ou
+    `None` se não criou (sinal não operável, ou já havia uma em
+    aberto).
+    """
+    if signal.direction == Direction.NEUTRAL or signal.risk.entry is None or signal.risk.stop is None:
+        return None
+
+    entries = load_signal_log()
+    for e in entries:
+        if (
+            e.get("status") == SIGNAL_LOG_OPEN_STATUS
+            and e.get("symbol") == symbol
+            and e.get("timeframe") == timeframe
+            and e.get("style") == style
+            and e.get("modality") == modality
+            and e.get("direction") == signal.direction.value
+        ):
+            return None  # já existe uma recomendação igual em aberto — não duplica
+
+    now_iso = pd.Timestamp.now(tz=LOCAL_TZ).isoformat()
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "logged_at": now_iso,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "style": style,
+        "modality": modality,
+        "source": source,
+        "direction": signal.direction.value,
+        "setup": signal.setup,
+        "score": round(signal.score, 1),
+        "entry": round(signal.risk.entry, 4),
+        "stop": round(signal.risk.stop, 4),
+        "target_1": round(signal.risk.target_1, 4) if signal.risk.target_1 is not None else None,
+        "target_2": round(signal.risk.target_2, 4) if signal.risk.target_2 is not None else None,
+        "status": SIGNAL_LOG_OPEN_STATUS,
+        "status_detail": "Aguardando verificação.",
+        "status_updated_at": now_iso,
+        "candles_ate_resultado": None,
+    }
+    entries.append(entry)
+    try:
+        save_signal_log(entries)
+    except OSError:
+        pass  # ambiente somente-leitura — o sinal fica só na sessão atual
+    return entry
+
+
+def refresh_signal_log(max_count: int = 400) -> list[dict]:
+    """
+    Percorre as recomendações ainda em aberto e verifica, com dados
+    reais buscados depois do horário exato de cada sinal, se o preço
+    já bateu o Alvo 1, o Alvo 2 ou o Stop (mesma lógica candle-a-candle
+    de `evaluate_signal_outcome`, usada na Verificação retroativa).
+    Cada entrada é reconferida usando a MESMA fonte de dados com que
+    foi registrada originalmente. Atualiza e salva o histórico.
+    """
+    entries = load_signal_log()
+    changed = False
+
+    for e in entries:
+        if e.get("status") != SIGNAL_LOG_OPEN_STATUS:
+            continue
+        try:
+            logged_at = pd.Timestamp(e["logged_at"])
+            logged_at_utc = (
+                logged_at.tz_convert("UTC") if logged_at.tzinfo is not None
+                else logged_at.tz_localize(LOCAL_TZ).tz_convert("UTC")
+            )
+
+            fetch_source = e.get("source") or "Yahoo Finance"
+            df = fetch_ohlcv(e["symbol"], e["timeframe"], max_count, source=fetch_source)
+            future = df[df.index > logged_at_utc]
+
+            if future.empty:
+                continue  # ainda não saiu candle novo depois do sinal — nada pra conferir por enquanto
+
+            risk = RiskPlan(
+                entry=e["entry"], stop=e["stop"],
+                target_1=e.get("target_1"), target_2=e.get("target_2"),
+            )
+            direction = Direction.BUY if e["direction"] == Direction.BUY.value else Direction.SELL
+
+            outcome, detail, candles = evaluate_signal_outcome(risk, direction, future)
+            if outcome in SIGNAL_LOG_TERMINAL_STATUSES:
+                e["status"] = outcome
+                e["status_detail"] = detail
+                e["status_updated_at"] = pd.Timestamp.now(tz=LOCAL_TZ).isoformat()
+                e["candles_ate_resultado"] = candles
+                changed = True
+        except Exception as exc:  # noqa: BLE001 — erro num ativo não pode travar a checagem dos outros
+            e["status_detail"] = f"Não foi possível verificar agora: {exc}"
+            changed = True
+
+    if changed:
+        try:
+            save_signal_log(entries)
+        except OSError:
+            pass
+    return entries
+
+
+def delete_signal_log_entry(entry_id: str) -> None:
+    entries = [e for e in load_signal_log() if e.get("id") != entry_id]
+    try:
+        save_signal_log(entries)
+    except OSError:
+        pass
+
+
+def clear_signal_log() -> None:
+    try:
+        save_signal_log([])
+    except OSError:
+        pass
+
+
 def analyze_symbol_mtf(
     symbol: str,
     confirmation: tuple[str, str] = CONFIRMATION_TIMEFRAMES,
@@ -1796,26 +2292,31 @@ def analyze_symbol_mtf(
     counts = counts or {}
     requested = list(dict.fromkeys([*confirmation, *context]))  # únicos, preserva ordem
 
-    # IFR: limiares mais frouxos (20/80) pra Swing Trade, pensados pra
-    # Diário/Semanal; mais extremos (10/90) pra Day Trade/WINFUT/demais
-    # combinações intraday — mantém a diferenciação prevista desde o
-    # planejamento original deste projeto.
-    rsi_thresholds = (20.0, 80.0) if confirmation == SWING_CONFIRMATION_TIMEFRAMES else (10.0, 90.0)
-
     needs_h1_only_for_h4 = "H4" in requested and "H1" not in requested
     fetch_list = [tf for tf in requested if tf != "H4"]
     if needs_h1_only_for_h4:
         fetch_list.insert(0, "H1")
 
+    # O Diário precisa ser processado ANTES dos demais: o IFR dele é
+    # injetado como filtro de contexto nas outras leituras (ver
+    # rsi_signal). Sem essa reordenação, M15/H1 seriam analisados antes
+    # do D1 existir e ficariam sem o filtro do timeframe maior.
+    if "D1" in fetch_list:
+        fetch_list = ["D1"] + [tf for tf in fetch_list if tf != "D1"]
+
     results: dict[str, TimeframeResult] = {}
     h1_df: pd.DataFrame | None = None
+    daily_rsi: float | None = None
 
     for tf in fetch_list:
         count = counts.get(tf, DEFAULT_TF_COUNTS.get(tf, 200))
         try:
             df = fetch_ohlcv(symbol, tf, count, source=source)
-            ctx, signals = analyze(df, rsi_thresholds=rsi_thresholds)
+            # O próprio D1 não recebe filtro de si mesmo; os demais sim.
+            ctx, signals = analyze(df, higher_rsi=None if tf == "D1" else daily_rsi)
             results[tf] = TimeframeResult(tf, ctx, signals, None)
+            if tf == "D1":
+                daily_rsi = ctx.rsi
             if tf == "H1":
                 h1_df = ctx.df
         except Exception as exc:  # noqa: BLE001 — mostra a falha, não derruba os outros timeframes
@@ -1826,7 +2327,7 @@ def analyze_symbol_mtf(
             try:
                 h4_df = _resample_to_h4(h1_df)
                 if len(h4_df) >= 30:
-                    ctx4, sig4 = analyze(h4_df, rsi_thresholds=rsi_thresholds)
+                    ctx4, sig4 = analyze(h4_df, higher_rsi=daily_rsi)
                     results["H4"] = TimeframeResult("H4", ctx4, sig4, None)
                 else:
                     results["H4"] = TimeframeResult(
