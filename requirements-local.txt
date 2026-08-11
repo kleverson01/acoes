@@ -1,0 +1,11 @@
+# Dependências extras pra rodar LOCALMENTE no Windows com MetaTrader 5.
+#
+# NÃO suba este arquivo como requirements.txt do Streamlit Cloud — o
+# pacote MetaTrader5 é uma DLL do Windows e a instalação vai FALHAR no
+# servidor Linux da nuvem, quebrando o deploy. Use assim, na sua
+# máquina Windows:
+#
+#   pip install -r requirements.txt
+#   pip install -r requirements-local.txt
+#
+MetaTrader5>=5.0.45
