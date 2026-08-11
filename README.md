@@ -160,6 +160,18 @@ Isso é bem mais simples e seguro que abrir porta no roteador (o que expõe seu 
 - PC do trabalho: só precisa do navegador + Tailscale instalado (pra entrar na mesma rede privada).
 - Se o PC de casa desligar ou o MT5 fechar, a fonte MT5 para de funcionar — pode trocar de volta pra Yahoo Finance na hora, sem precisar reiniciar nada.
 
+## IFR (RSI) — 6ª leitura, exaustão de curto prazo
+
+Nova leitura, ao lado de Confluência/SMC/Price Action/Médias Móveis/VWAP: **IFR**. Diferente das outras (que usam "manda em"), o IFR entra como leitura independente adicional — não faz parte do cálculo interno da Confluência, que continua com as 4 categorias originais intactas.
+
+**Como funciona:** ficar DENTRO da zona extrema já é o sinal (não espera o IFR sair da zona pra confirmar) — IFR muito baixo = exaustão vendedora (viés de compra); IFR muito alto = exaustão compradora (viés de venda). É uma leitura contrária por natureza, pensada pra reversões de curto prazo, não pra seguir tendência.
+
+**Limiares diferentes por estilo:**
+- Day Trade / WINFUT: 10 (sobrevenda) / 90 (sobrecompra) — mais extremo, intraday
+- Swing Trade: 20 / 80 — mais frouxo, Diário/Semanal
+
+Aparece nas abas de gráfico, no seletor de Modalidade, no Scanner e na Verificação retroativa — em todo lugar que as outras 5 leituras já apareciam.
+
 ## Mini Índice (WINFUT) — aba dedicada
 
 Quarto modo na barra lateral, separado da watchlist de ações: **Mini Índice (WINFUT)**. Analisa exclusivamente o contrato futuro do mini índice, em 4 timeframes próprios — **2 minutos, 5 minutos, 15 minutos e 60 minutos** — com confirmação em **M5+M15** (M2 e H1 entram como contexto: M2 pra afinar o timing de entrada, H1 pro contexto da sessão).

@@ -195,6 +195,8 @@ class MarketContext:
     bullish_retest: bool
     bearish_retest: bool
     fvg_setup: str | None
+    rsi: float
+    rsi_series: pd.Series
 
 
 @dataclass
@@ -332,7 +334,7 @@ def _fetch_ohlcv_github(symbol: str, timeframe: str, count: int) -> pd.DataFrame
             "st.secrets['github_repo'] no formato 'usuario/nome-do-repositorio'."
         )
 
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json"
+    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/HEAD/data/mt5_snapshot.json"
     headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
 
     try:
@@ -375,7 +377,7 @@ def fetch_snapshot_timestamp() -> str | None:
 
     if not GITHUB_BRIDGE_REPO:
         return None
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json"
+    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/HEAD/data/mt5_snapshot.json"
     headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
     try:
         response = requests.get(url, headers=headers, timeout=10)
@@ -815,6 +817,17 @@ def detect_fvg_setup(df: pd.DataFrame, max_age: int = 20) -> str | None:
     return None
 
 
+def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """IFR/RSI clássico (suavização de Wilder, período 14)."""
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    return 100 - (100 / (1 + rs))
+
+
 def build_context(df: pd.DataFrame) -> MarketContext:
     if len(df) < 30:
         raise ValueError("São necessários pelo menos 30 candles fechados.")
@@ -848,6 +861,8 @@ def build_context(df: pd.DataFrame) -> MarketContext:
     swings = detect_swings(df)
     events = detect_structure(df, swings, atr_series)
     broke_high, broke_low, bullish_retest, bearish_retest = breakout_and_retest(df, atr)
+    rsi_series = compute_rsi(df)
+    rsi = float(rsi_series.iloc[-1]) if pd.notna(rsi_series.iloc[-1]) else 50.0
 
     return MarketContext(
         df=df,
@@ -870,6 +885,8 @@ def build_context(df: pd.DataFrame) -> MarketContext:
         bullish_retest=bullish_retest,
         bearish_retest=bearish_retest,
         fvg_setup=detect_fvg_setup(df),
+        rsi=rsi,
+        rsi_series=rsi_series,
     )
 
 
@@ -1187,6 +1204,50 @@ def vwap_signal(context: MarketContext) -> Signal:
     )
 
 
+def ifr_signal(context: MarketContext, oversold: float = 20.0, overbought: float = 80.0) -> Signal:
+    """
+    IFR/RSI como leitura de exaustão: ficar DENTRO da zona extrema já é
+    o sinal — não espera o IFR SAIR da zona pra confirmar. IFR muito
+    baixo = exaustão vendedora (viés de compra); IFR muito alto =
+    exaustão compradora (viés de venda). Quanto mais fundo na zona,
+    maior o score — é uma leitura contrária por natureza, pensada pra
+    capturar reversões de curto prazo, não seguir tendência.
+    """
+    reasons: list[str] = []
+    rsi = context.rsi
+
+    if rsi <= oversold:
+        depth = (oversold - rsi) / oversold if oversold > 0 else 0.0
+        direction = Direction.BUY
+        score = 60.0 + min(depth, 1.0) * 40.0
+        setup = f"IFR em exaustão vendedora ({rsi:.1f} ≤ {oversold:.0f})"
+        reasons.append(f"IFR(14) em {rsi:.1f}, dentro da zona de sobrevenda (≤{oversold:.0f})")
+    elif rsi >= overbought:
+        depth = (rsi - overbought) / (100 - overbought) if overbought < 100 else 0.0
+        direction = Direction.SELL
+        score = 60.0 + min(depth, 1.0) * 40.0
+        setup = f"IFR em exaustão compradora ({rsi:.1f} ≥ {overbought:.0f})"
+        reasons.append(f"IFR(14) em {rsi:.1f}, dentro da zona de sobrecompra (≥{overbought:.0f})")
+    else:
+        direction = Direction.NEUTRAL
+        score = 15.0
+        setup = "Sem setup claro (IFR)"
+        reasons.append(f"IFR(14) em {rsi:.1f}, fora das zonas extremas ({oversold:.0f}/{overbought:.0f})")
+
+    direction, score, confidence = apply_market_filter(
+        direction, score, score * 0.75, context, isolated=True,
+    )
+    return Signal(
+        "IFR",
+        direction,
+        score,
+        confidence,
+        setup if direction != Direction.NEUTRAL else "Sem setup operável (IFR)",
+        reasons,
+        market_alerts(context) + ["LEITURA ISOLADA — confirme com outras categorias"],
+    )
+
+
 def confluence_signal(
     context: MarketContext,
     isolated: list[Signal],
@@ -1326,6 +1387,13 @@ def stop_for_signal(
             return base - context.atr * 0.3, "EMA21/EMA50"
         base = float(ema["ema_21"] if ema["ema_21"] > price else ema["ema_50"])
         return base + context.atr * 0.3, "EMA21/EMA50"
+
+    if signal.name == "IFR":
+        # IFR não tem nível de preço próprio (é leitura de momentum, não
+        # de estrutura) — usa ATR puro, igual ao fallback genérico.
+        if direction == Direction.BUY:
+            return price - context.atr * 1.2, "ATR"
+        return price + context.atr * 1.2, "ATR"
 
     if direction == Direction.BUY:
         return context.vwap - context.atr * 0.5, "VWAP"
@@ -1490,7 +1558,7 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         )
 
 
-def analyze(df: pd.DataFrame) -> tuple[MarketContext, list[Signal]]:
+def analyze(df: pd.DataFrame, rsi_thresholds: tuple[float, float] = (10.0, 90.0)) -> tuple[MarketContext, list[Signal]]:
     context = build_context(df)
     isolated = [
         smc_signal(context),
@@ -1499,7 +1567,8 @@ def analyze(df: pd.DataFrame) -> tuple[MarketContext, list[Signal]]:
         vwap_signal(context),
     ]
     confluence = confluence_signal(context, isolated)
-    signals = [confluence, *isolated]
+    ifr = ifr_signal(context, oversold=rsi_thresholds[0], overbought=rsi_thresholds[1])
+    signals = [confluence, *isolated, ifr]
 
     for signal in signals:
         attach_risk(signal, context)
@@ -1524,7 +1593,7 @@ class MultiTimeframeResult:
     confirmed_direction: Direction
 
 
-MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP")
+MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR")
 ALL_MODALITIES_OPTION = "Todas as modalidades"
 MODALITY_CHOICES = (ALL_MODALITIES_OPTION, *MODALITIES)
 
@@ -1727,6 +1796,12 @@ def analyze_symbol_mtf(
     counts = counts or {}
     requested = list(dict.fromkeys([*confirmation, *context]))  # únicos, preserva ordem
 
+    # IFR: limiares mais frouxos (20/80) pra Swing Trade, pensados pra
+    # Diário/Semanal; mais extremos (10/90) pra Day Trade/WINFUT/demais
+    # combinações intraday — mantém a diferenciação prevista desde o
+    # planejamento original deste projeto.
+    rsi_thresholds = (20.0, 80.0) if confirmation == SWING_CONFIRMATION_TIMEFRAMES else (10.0, 90.0)
+
     needs_h1_only_for_h4 = "H4" in requested and "H1" not in requested
     fetch_list = [tf for tf in requested if tf != "H4"]
     if needs_h1_only_for_h4:
@@ -1739,7 +1814,7 @@ def analyze_symbol_mtf(
         count = counts.get(tf, DEFAULT_TF_COUNTS.get(tf, 200))
         try:
             df = fetch_ohlcv(symbol, tf, count, source=source)
-            ctx, signals = analyze(df)
+            ctx, signals = analyze(df, rsi_thresholds=rsi_thresholds)
             results[tf] = TimeframeResult(tf, ctx, signals, None)
             if tf == "H1":
                 h1_df = ctx.df
@@ -1751,7 +1826,7 @@ def analyze_symbol_mtf(
             try:
                 h4_df = _resample_to_h4(h1_df)
                 if len(h4_df) >= 30:
-                    ctx4, sig4 = analyze(h4_df)
+                    ctx4, sig4 = analyze(h4_df, rsi_thresholds=rsi_thresholds)
                     results["H4"] = TimeframeResult("H4", ctx4, sig4, None)
                 else:
                     results["H4"] = TimeframeResult(

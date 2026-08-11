@@ -6,7 +6,7 @@ nada do motor — só importa as funções e desenha por cima.
 
 Dois modos (barra lateral):
     - Análise individual: gráfico de candles com EMAs/VWAP/swings/BOS-CHoCH/
-      zonas de FVG, mais os painéis das 5 leituras. Pode auto-atualizar.
+      zonas de FVG, mais os painéis das 6 leituras (incluindo IFR). Pode auto-atualizar.
     - Scanner: roda a análise em TODOS os ativos da watchlist de uma vez e
       mostra um ranking por score de confluência (o "Top N" do requisito
       original), com atalho pra abrir qualquer um na análise individual.
@@ -484,7 +484,7 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
         with tab:
             render_signal_panel(s, symbol, risk_budget)
 
-    st.markdown("### Resumo — as 5 leituras lado a lado")
+    st.markdown("### Resumo — as 6 leituras lado a lado")
     st.dataframe(
         [{
             "Análise": s.name, "Direção": s.direction.value, "Score": round(s.score, 1),
@@ -590,8 +590,8 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             score_b = round(overall_score(result_b.signals), 1)
             confluence_a = next(s for s in result_a.signals if s.name == "Confluência")
             setup_text = (
-                f"Score geral (média de 5 leituras) — {confluence_a.setup}" if mtf.confirmed
-                else f"Score geral (média de 5 leituras) — sem confirmação entre {tf_a}/{tf_b}"
+                f"Score geral (média de 6 leituras) — {confluence_a.setup}" if mtf.confirmed
+                else f"Score geral (média de 6 leituras) — sem confirmação entre {tf_a}/{tf_b}"
             )
             risk = confluence_a.risk if (mtf.confirmed and confluence_a.direction == mtf.confirmed_direction) else None
         else:
@@ -759,9 +759,9 @@ with st.sidebar:
     st.markdown("### Modalidade")
     modality = st.selectbox(
         "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
-        help="Confluência combina as 4 categorias. SMC/Price Action/Médias Móveis/VWAP usam só a "
-             "leitura isolada daquela categoria. \"Todas as modalidades\" calcula um SCORE GERAL "
-             "(média das 5 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
+        help="Confluência combina as 4 categorias estruturais (SMC/Price Action/Médias/VWAP). "
+             "IFR é uma leitura de exaustão independente, fora da Confluência. \"Todas as modalidades\" calcula um SCORE GERAL "
+             "(média das 6 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
              "e ordenar o Scanner.",
     )
 
@@ -858,7 +858,7 @@ elif mode == "Scanner (todos os ativos)":
 
         st.markdown("#### Abrir análise completa de um ativo")
         pick = st.selectbox("Ativo", result_df["Ativo"].tolist(), key="scanner_pick_select")
-        if st.button("Ver gráfico e as 5 leituras completas"):
+        if st.button("Ver gráfico e as 6 leituras completas"):
             st.session_state.jump_to_symbol = pick
             st.rerun()
     else:
