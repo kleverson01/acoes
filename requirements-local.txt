@@ -1,32 +1,23 @@
-# Dependências extras pra rodar LOCALMENTE no Windows com MetaTrader 5.
+# Dependências para rodar LOCALMENTE, na sua máquina Windows.
 #
-# NÃO suba este arquivo como requirements.txt do Streamlit Cloud — o
-# pacote MetaTrader5 é uma DLL do Windows e a instalação vai FALHAR no
-# servidor Linux da nuvem, quebrando o deploy. Use assim, na sua
-# máquina Windows:
+# Use assim, depois do requirements.txt:
+#   python -m pip install -r requirements.txt
+#   python -m pip install -r requirements-local.txt
 #
-#   pip install -r requirements.txt
-#   pip install -r requirements-local.txt
-#
+# NÃO use este arquivo no Streamlit Cloud: o pacote MetaTrader5 é uma
+# DLL do Windows e falha em servidor Linux.
+
 MetaTrader5>=5.0.45
 
-# Trava a versão do NumPy abaixo de 2.1 nesta máquina. A partir da
-# 2.1, os wheels pré-compilados do NumPy pra Windows passaram a exigir
-# instruções de CPU "x86-64-v2" (inclui SSE4.2) — em processadores
-# mais antigos (ou algumas VMs) sem esse suporte, o import quebra com
-# "RuntimeError: NumPy was built with baseline optimizations (X86_V2)
-# but your machine doesn't support (X86_V2)". A 1.26.4 é a última
-# versão 1.x com suporte oficial ao Python 3.12+ e não tem essa
-# exigência — funciona com o baseline SSE2, presente em qualquer CPU
-# x86-64. Sem esse pin, o próximo "pip install -r requirements.txt"
-# (inclusive dentro do workflow do GitHub Actions) reinstalaria a
-# versão mais nova e quebraria de novo.
+# --- Versões fixas por causa da CPU desta máquina ---
+#
+# O processador (Core2 Duo E8400, de 2008) não tem as instruções
+# x86-64-v2 (SSE4.2/POPCNT) que os wheels de numpy >= 2.1 e
+# pandas >= 2.2 para Windows exigem. Com versão incompatível, o import
+# não dá erro Python: derruba o processo inteiro sem mensagem
+# (código -1073741795 / 0xC000001D, "instrução ilegal").
+#
+# Estes pins vêm DEPOIS do requirements.txt de propósito: eles
+# sobrescrevem o que foi instalado antes, corrigindo a versão só aqui.
 numpy==1.26.4
-
-# Mesmo motivo do NumPy acima: a partir da 2.2, os wheels do Pandas
-# pra Windows também passaram a exigir "x86-64-v2" — nesta máquina,
-# isso não dá um erro Python normal, trava o processo inteiro sem
-# nenhuma mensagem (código de saída -1073741795 / 0xC000001D,
-# "instrução ilegal"). A 2.1.4 funciona com o baseline SSE2 normal.
 pandas==2.1.4
-

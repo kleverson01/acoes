@@ -1,6 +1,18 @@
-pandas>=2.2
+# Dependências para o Streamlit Cloud (servidor Linux).
+#
+# IMPORTANTE: mantenha faixas abertas aqui. As versões fixas de numpy
+# e pandas que a máquina local precisa (CPU antiga, sem x86-64-v2)
+# ficam em requirements-local.txt, e SÓ lá — fixá-las neste arquivo
+# quebra o deploy na nuvem, porque numpy 1.26.4 e pandas 2.1.4 não
+# têm wheels para Python 3.13. Sem wheel, o pip tenta compilar do
+# zero e a instalação falha.
+#
+# O plotly fica abaixo da 6 porque o componente de gráfico do
+# Streamlit falha ao carregar o módulo JS com a 6.x.
+
+pandas>=2.0
 numpy>=1.26
-yfinance>=0.2.40
+plotly>=5.22,<6
 streamlit>=1.38
-plotly>=5.22
+yfinance>=0.2.40
 requests>=2.31
