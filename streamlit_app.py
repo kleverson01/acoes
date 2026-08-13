@@ -19,26 +19,13 @@ Rodar pela internet sem instalar nada: ver README.md.
 
 from __future__ import annotations
 
-import hmac
-import os
 import time
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# set_page_config precisa ser o PRIMEIRO comando Streamlit do script —
-# antes de qualquer outro, inclusive de st.secrets. Ler os secrets com
-# o arquivo ausente emite um aviso que já conta como "primeiro
-# comando", e aí esta chamada falha com StreamlitAPIException.
-st.set_page_config(page_title="Terminal SMC · B3", page_icon="◆", layout="wide",
-                   initial_sidebar_state="expanded")
-
-
 import daytrade_smc
-
-# Núcleo estável: nomes que existem desde as primeiras versões do
-# motor. Se algum destes faltar, o app realmente não tem como rodar.
 from daytrade_smc import (
     ALL_MODALITIES_OPTION,
     DATA_SOURCES,
@@ -52,92 +39,32 @@ from daytrade_smc import (
     SWING_CONTEXT_TIMEFRAMES,
     analyze_symbol_mtf,
     check_signal_as_of,
+    clear_signal_log,
+    delete_signal_log_entry,
+    fetch_snapshot_timestamp,
+    load_signal_log,
     load_symbols,
+    log_signal,
     overall_agreement,
     overall_direction,
     overall_score,
     quality,
+    refresh_signal_log,
+    request_mt5_update,
     save_symbols,
     yahoo_symbol,
 )
-
-
-# Recursos adicionados depois (histórico de sinais, ponte MT5, WINFUT).
-# Resolvidos por getattr em vez de `from ... import`, porque um import
-# rígido quebra o app INTEIRO com ImportError quando só um dos dois
-# arquivos é atualizado no deploy — situação comum ao editar pelo
-# navegador do GitHub. Assim, o recurso indisponível simplesmente
-# desliga, e o resto continua de pé.
-def _opcional(nome, padrao=None):
-    return getattr(daytrade_smc, nome, padrao)
-
-
-def _faltando(*_a, **_k):
-    raise RuntimeError(
-        "Este recurso exige uma versão mais nova do daytrade_smc.py. "
-        "Atualize os DOIS arquivos (daytrade_smc.py e streamlit_app.py) juntos."
-    )
-
-
-clear_signal_log = _opcional("clear_signal_log", lambda: None)
-delete_signal_log_entry = _opcional("delete_signal_log_entry", lambda *_: None)
-load_signal_log = _opcional("load_signal_log", lambda: [])
-log_signal = _opcional("log_signal", lambda *a, **k: None)
-refresh_signal_log = _opcional("refresh_signal_log", lambda *a, **k: [])
-fetch_snapshot_timestamp = _opcional("fetch_snapshot_timestamp", lambda: None)
-request_mt5_update = _opcional(
-    "request_mt5_update",
-    lambda: (False, "Recurso indisponível nesta versão do daytrade_smc.py."),
-)
-
-# Recursos ausentes viram uma lista que a interface consulta pra avisar
-# o usuário uma única vez, em vez de falhar silenciosamente.
-_RECURSOS_AUSENTES = [
-    nome for nome in (
-        "load_signal_log", "log_signal", "refresh_signal_log",
-        "mt5_is_available", "rsi_extremes_across_timeframes",
-        "resolve_winfut_symbol", "WINFUT_CONFIRMATION_TIMEFRAMES",
-    )
-    if not hasattr(daytrade_smc, nome)
-]
 
 # Configura a ponte GitHub a partir dos secrets do Streamlit (Settings
 # → Secrets no Streamlit Cloud, ou .streamlit/secrets.toml localmente).
 # Sem isso configurado, a fonte "GitHub (MT5 de casa)" dá erro claro em
 # vez de travar — ver README.
-def _ler_secret(chave: str):
-    """
-    Lê um secret sem poluir a tela quando não há secrets.toml.
-
-    Detalhe que importa: `st.secrets.get()` não só levanta exceção
-    quando o arquivo não existe — ele também RENDERIZA o erro na
-    página antes de levantar. Um try/except em volta captura a
-    exceção, mas a mensagem "No secrets found" já apareceu para o
-    usuário (aparecia três vezes por carregamento).
-
-    Por isso verificamos a existência dos arquivos ANTES de tocar em
-    `st.secrets`. Os caminhos são os documentados pelo Streamlit — não
-    dependemos de atributos internos, que mudam entre versões.
-
-    Nenhum secret é obrigatório aqui (ponte GitHub e senha de acesso
-    são opcionais), então ausência é o caso normal em uso local.
-    """
-    caminhos = (
-        os.path.join(os.path.expanduser("~"), ".streamlit", "secrets.toml"),
-        os.path.join(os.getcwd(), ".streamlit", "secrets.toml"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit", "secrets.toml"),
-        "/etc/secrets/secrets.toml",  # usado pelo Streamlit Cloud
-    )
-    if not any(os.path.exists(p) for p in caminhos):
-        return None
-    try:
-        return st.secrets.get(chave)
-    except Exception:
-        return None
-
-
-daytrade_smc.GITHUB_BRIDGE_REPO = _ler_secret("github_repo")
-daytrade_smc.GITHUB_BRIDGE_TOKEN = _ler_secret("github_token")
+try:
+    daytrade_smc.GITHUB_BRIDGE_REPO = st.secrets.get("github_repo")
+    daytrade_smc.GITHUB_BRIDGE_TOKEN = st.secrets.get("github_token")
+except Exception:
+    daytrade_smc.GITHUB_BRIDGE_REPO = None
+    daytrade_smc.GITHUB_BRIDGE_TOKEN = None
 
 STYLES = {
     "Day Trade": {
@@ -154,11 +81,14 @@ STYLES = {
     # ações ele é só contexto), porque o WIN gira rápido demais para
     # esperar o fechamento do M15 como gatilho único.
     "WINFUT": {
-        "confirmation": _opcional("WINFUT_CONFIRMATION_TIMEFRAMES", ("M5", "M15")),
-        "context": _opcional("WINFUT_CONTEXT_TIMEFRAMES", ("H1", "D1")),
+        "confirmation": daytrade_smc.WINFUT_CONFIRMATION_TIMEFRAMES,
+        "context": daytrade_smc.WINFUT_CONTEXT_TIMEFRAMES,
         "count_label": "Candles fechados (M5 e M15)",
     },
 }
+
+st.set_page_config(page_title="Terminal SMC · B3", page_icon="◆", layout="wide",
+                   initial_sidebar_state="expanded")
 
 # ========================================================================
 # Sistema visual
@@ -203,17 +133,6 @@ DIRECTION_COLOR = {
 
 
 def inject_theme() -> None:
-    # A tradução automática do navegador quebra apps React (Streamlit):
-    # ela troca os nós de texto do DOM, e o React depois tenta remover
-    # nós que já não estão onde ele registrou — erro "Failed to execute
-    # 'removeChild' on 'Node'". Como a interface já está em português,
-    # traduzir não traz ganho nenhum. As duas metatags abaixo pedem ao
-    # Google/Chrome e ao Bing/Edge que não traduzam esta página.
-    st.markdown(
-        '<meta name="google" content="notranslate">'
-        '<meta name="translate" content="no">',
-        unsafe_allow_html=True,
-    )
     st.markdown(f"""<style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
@@ -349,112 +268,36 @@ inject_theme()
 
 
 # ========================================================================
-# Portão de acesso
-#
-# Só entra em ação se houver senha configurada em
-# .streamlit/secrets.toml (chave `app_password`) ou na variável de
-# ambiente APP_PASSWORD. Sem senha definida, o app abre direto — é o
-# comportamento certo para uso local, onde a única forma de chegar até
-# ele é já estar na máquina.
-#
-# A senha existe para o acesso remoto: publicado por um túnel, o app
-# fica alcançável por quem tiver a URL. Comparação com
-# `compare_digest` para não vazar informação pelo tempo de resposta.
-# ========================================================================
-def _senha_configurada():
-    return _ler_secret("app_password") or os.environ.get("APP_PASSWORD") or None
-
-
-def portao_de_acesso() -> None:
-    senha_certa = _senha_configurada()
-    if not senha_certa or st.session_state.get("_autenticado"):
-        return
-
-    _, meio, _ = st.columns([1, 1.5, 1])
-    with meio:
-        st.markdown(
-            f'<div style="text-align:center;padding:52px 0 20px 0">'
-            f'<div style="font-family:Space Grotesk,sans-serif;font-size:1.9rem;font-weight:700;'
-            f'letter-spacing:-0.03em">TERMINAL <span style="color:{COLORS["signal"]}">SMC</span></div>'
-            f'<div style="font-family:JetBrains Mono,monospace;font-size:0.64rem;'
-            f'letter-spacing:0.16em;color:{COLORS["muted"]};text-transform:uppercase;margin-top:6px">'
-            f'Acesso restrito</div></div>',
-            unsafe_allow_html=True,
-        )
-        tentativa = st.text_input("Senha", type="password", key="_senha_input",
-                                  label_visibility="collapsed", placeholder="Senha de acesso")
-        if st.button("Entrar", type="primary", use_container_width=True):
-            if hmac.compare_digest(str(tentativa), str(senha_certa)):
-                st.session_state._autenticado = True
-                st.rerun()
-            else:
-                st.markdown(
-                    f'<div style="color:{COLORS["sell"]};font-size:0.84rem;text-align:center;'
-                    f'margin-top:10px">Senha incorreta.</div>',
-                    unsafe_allow_html=True,
-                )
-    st.stop()
-
-
-portao_de_acesso()
-
-
-
-# ========================================================================
 # Dados / cache / análise
 # ========================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
+def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-    # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
-    # troca de ordem em qualquer ponto da cadeia inverta a leitura do
-    # IFR silenciosamente — bug que já ocorreu e é difícil de notar,
-    # porque o app continua funcionando, só que com o sinal ao contrário.
-    daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
-    daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
-    # O estilo entra como PARÂMETRO (não só variável global) para fazer
-    # parte da chave do cache: sem isso, trocar de estilo devolveria o
-    # resultado calculado com os pesos do estilo anterior.
-    daytrade_smc.ACTIVE_STYLE = style
+    daytrade_smc.RSI_OVERSOLD = rsi_os
+    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance")
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
+def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-    # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
-    # troca de ordem em qualquer ponto da cadeia inverta a leitura do
-    # IFR silenciosamente — bug que já ocorreu e é difícil de notar,
-    # porque o app continua funcionando, só que com o sinal ao contrário.
-    daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
-    daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
-    # O estilo entra como PARÂMETRO (não só variável global) para fazer
-    # parte da chave do cache: sem isso, trocar de estilo devolveria o
-    # resultado calculado com os pesos do estilo anterior.
-    daytrade_smc.ACTIVE_STYLE = style
+    daytrade_smc.RSI_OVERSOLD = rsi_os
+    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5")
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
+def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-    # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
-    # troca de ordem em qualquer ponto da cadeia inverta a leitura do
-    # IFR silenciosamente — bug que já ocorreu e é difícil de notar,
-    # porque o app continua funcionando, só que com o sinal ao contrário.
-    daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
-    daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
-    # O estilo entra como PARÂMETRO (não só variável global) para fazer
-    # parte da chave do cache: sem isso, trocar de estilo devolveria o
-    # resultado calculado com os pesos do estilo anterior.
-    daytrade_smc.ACTIVE_STYLE = style
+    daytrade_smc.RSI_OVERSOLD = rsi_os
+    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)")
 
 
-def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     """
     Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
     rate limit); MetaTrader 5 direto usa 3s; GitHub (MT5 de casa) usa
@@ -470,10 +313,10 @@ def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: 
     segundos, resultado calculado com o valor antigo.
     """
     if source == "MetaTrader 5":
-        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob, style)
+        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
     if source == "GitHub (MT5 de casa)":
-        return _cached_mtf_github(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob, style)
-    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob, style)
+        return _cached_mtf_github(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
+    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
@@ -651,14 +494,9 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) 
         if risk_budget:
             risk_per_share = abs(risk.entry - risk.stop)
             if risk_per_share > 0:
-                # +15% sobre o dimensionamento teórico: compensa o
-                # alvo encurtado em 15%, mantendo o retorno financeiro
-                # por operação aproximadamente igual.
-                boost = getattr(daytrade_smc, "QUANTITY_BOOST", 1.0)
-                qty = int((risk_budget // risk_per_share) * boost)
+                qty = int(risk_budget // risk_per_share)
                 st.caption(f"Com risco de R$ {risk_budget:.2f}: **{qty} ações** · "
-                          f"risco real R$ {qty*risk_per_share:.2f} · total R$ {qty*risk.entry:.2f}"
-                          + (f" · inclui +{(boost-1)*100:.0f}% de ajuste" if boost != 1.0 else ""))
+                          f"risco real R$ {qty*risk_per_share:.2f} · total R$ {qty*risk.entry:.2f}")
 
         if risk.alternatives:
             st.markdown("**Possibilidades de saída:**")
@@ -835,7 +673,7 @@ def render_winfut(style: str, modality: str, source: str, count: int, risk_budge
         unsafe_allow_html=True,
     )
 
-    render_individual_analysis(_opcional("WINFUT_LABEL", "WINFUT"), style, modality, source, count,
+    render_individual_analysis(daytrade_smc.WINFUT_LABEL, style, modality, source, count,
                                risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
 
 
@@ -992,30 +830,7 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
 
     fonte_label = "MT5 (tempo real)" if source == "MetaTrader 5" else "Yahoo Finance (atraso ~15-20min)"
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob, style)
-
-    # Quando a FONTE falha, todos os prazos falham juntos. Mostrar cinco
-    # caixas vermelhas idênticas não informa mais que uma — e dá a
-    # impressão de que o app quebrou, quando o problema é externo.
-    falhas = [tf for tf in all_tfs if mtf.results[tf].error]
-    if len(falhas) == len(all_tfs):
-        primeiro_erro = mtf.results[falhas[0]].error or ""
-        st.markdown(
-            f'<div class="card accent-sell">'
-            f'<div class="eyebrow">Fonte de dados indisponível</div>'
-            f'<div style="font-size:0.92rem">Nenhum prazo de <b>{symbol}</b> pôde ser carregado '
-            f'via {source}.</div>'
-            f'<div style="color:{COLORS["muted"]};font-size:0.84rem;margin-top:7px">'
-            f'{primeiro_erro[:220]}</div></div>',
-            unsafe_allow_html=True,
-        )
-        if source == "Yahoo Finance":
-            st.caption(
-                "O Yahoo aplica limite de requisições quando muitas consultas partem do mesmo "
-                "endereço — comum em servidores compartilhados. Aguarde alguns minutos, ou use "
-                "MetaTrader 5 rodando o app localmente."
-            )
-        return
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob)
 
     render_confirmation_badge(mtf, confirmation, symbol, style, source, min_score_to_log)
     render_rsi_multi_tf(mtf)
@@ -1025,13 +840,7 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
         with tab:
             result = mtf.results[tf]
             if result.error:
-                st.markdown(
-                    f'<div class="card accent-mute">'
-                    f'<div class="eyebrow">Prazo indisponível</div>'
-                    f'<div style="color:{COLORS["muted"]};font-size:0.86rem">{result.error[:220]}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+                st.error(f"Não foi possível analisar {symbol} em {tf}: {result.error}")
                 continue
             render_timeframe_panel(symbol, tf, result.context, result.signals, risk_budget)
 
@@ -1063,9 +872,8 @@ def render_rsi_multi_tf(mtf) -> None:
     if not por_tf:
         return
 
-    _a = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
-    _b = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
-    os_, ob = min(_a, _b), max(_a, _b)
+    ob = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
+    os_ = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
     n, direcao = resumo["alinhamento"], resumo["direcao"]
 
     if n >= 1:
@@ -1109,9 +917,8 @@ def render_rsi_multi_tf(mtf) -> None:
 def render_rsi_badge(context) -> None:
     """Trilho de IFR do prazo atual, com o diário como referência."""
     rsi = context.rsi
-    _a = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
-    _b = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
-    os_, ob = min(_a, _b), max(_a, _b)
+    ob = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
+    os_ = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
 
     if rsi <= os_:
         estado, cor, classe = "EXAUSTÃO VENDEDORA → COMPRA", COLORS["buy"], "accent-signal"
@@ -1230,7 +1037,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob, style)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
@@ -1238,7 +1045,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             err = (result_a.error or result_b.error or "")[:60]
             rows.append({"Ativo": symbol, "OK": "⚠️", "Direção": "ERRO", "Score": None,
                         col_a: None, col_b: None, f"IFR {tf_a}": None, "IFR D1": None,
-                        "Entrada": None, "Stop": None, "Alvo 1": None,
+                        "Exaustão": "", "Entrada": None, "Stop": None, "Alvo 1": None,
                         "Setup": err})
             if source != "MetaTrader 5":
                 time.sleep(0.3)
@@ -1278,20 +1085,30 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
         d1_result = mtf.results.get("D1")
         rsi_d1 = round(d1_result.context.rsi, 1) if (d1_result and d1_result.context) else None
 
-        # Recomendado = confirmado nos dois prazos E score acima do
-        # piso. Sem o piso, ativos com confirmação fraca apareciam com
-        # o mesmo destaque dos fortes.
-        recomendado = mtf.confirmed and score_geral >= min_score_to_log
+        # Quantos timeframes estão em exaustão simultânea na mesma
+        # direção — é o filtro mais seletivo que o IFR oferece aqui.
+        consolidar_rsi = getattr(daytrade_smc, "rsi_extremes_across_timeframes", None)
+        resumo_rsi = consolidar_rsi(mtf) if consolidar_rsi else {"alinhamento": 0, "direcao": None}
+        n_extremos = resumo_rsi["alinhamento"]
+        if n_extremos >= 2:
+            seta = "🟢↓" if resumo_rsi["direcao"] == Direction.BUY.value else "🔴↑"
+            exaustao = f"🎯 {n_extremos} TFs {seta}"
+        elif n_extremos == 1:
+            seta = "↓" if resumo_rsi["direcao"] == Direction.BUY.value else "↑"
+            exaustao = f"1 TF {seta}"
+        else:
+            exaustao = ""
 
         rows.append({
             "Ativo": ("🌟 " if destaque else "") + symbol,
-            "OK": "✅" if recomendado else ("~" if mtf.confirmed else "—"),
+            "OK": "✅" if mtf.confirmed else "—",
             "Direção": direction_label,
             "Score": score_geral,
             col_a: score_a,
             col_b: score_b,
             f"IFR {tf_a}": rsi_tf,
             "IFR D1": rsi_d1,
+            "Exaustão": exaustao,
             "Entrada": round(risk.entry, 2) if risk and risk.entry else None,
             "Stop": round(risk.stop, 2) if risk and risk.stop else None,
             "Alvo 1": round(risk.target_1, 2) if risk and risk.target_1 else None,
@@ -1308,7 +1125,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
         # diretamente: ela guarda símbolos ("✅", "—", "⚠️") e a ordem
         # alfabética deles não corresponde à prioridade desejada. Por
         # isso usamos uma coluna auxiliar numérica, descartada em seguida.
-        result["_ordem"] = result["OK"].map({"✅": 0, "~": 1, "—": 2, "⚠️": 3}).fillna(4)
+        result["_ordem"] = result["OK"].map({"✅": 0, "—": 1, "⚠️": 2}).fillna(3)
         result = result.sort_values(["_ordem", "Score"], ascending=[True, False], na_position="last")
         result = result.drop(columns="_ordem").reset_index(drop=True)
     return result
@@ -1349,12 +1166,12 @@ def _persist_watchlist() -> None:
 # ========================================================================
 with st.sidebar:
     st.markdown(
-        f'<div style="font-family:Space Grotesk,sans-serif;font-size:1.24rem;font-weight:700;'
-        f'letter-spacing:-0.03em;margin-bottom:2px">TERMINAL '
-        f'<span style="color:{COLORS["signal"]}">SMC</span></div>'
-        f'<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;letter-spacing:0.15em;'
-        f'color:{COLORS["muted"]};text-transform:uppercase;margin-bottom:16px">'
-        f'SMC · Price Action · Médias · VWAP · IFR</div>',
+        '<div style="font-family:Space Grotesk,sans-serif;font-size:1.24rem;font-weight:700;'
+        'letter-spacing:-0.03em;margin-bottom:2px">TERMINAL <span style="color:'
+        + COLORS["signal"] + '">SMC</span></div>'
+        '<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;letter-spacing:0.15em;'
+        'color:' + COLORS["muted"] + ';text-transform:uppercase;margin-bottom:16px">'
+        'SMC · Price Action · Médias · VWAP · IFR</div>',
         unsafe_allow_html=True,
     )
 
@@ -1453,11 +1270,6 @@ with st.sidebar:
             help="Day Trade confirma em 15+60 minutos (posições no mesmo dia). "
                  "Swing Trade confirma em Diário+Semanal, com 240 minutos como contexto de entrada.",
         )
-        _cfg = getattr(daytrade_smc, "STYLE_CONFIG", {}).get(style)
-        if _cfg:
-            _ativas = [k for k, v in _cfg["weights"].items() if v > 0]
-            _nota = " · IFR não filtra" if not _cfg["rsi_filter"] else ""
-            st.caption(f"Decide por: {' · '.join(_ativas)}{_nota}")
     conf_a, conf_b = STYLES[style]["confirmation"]
 
     st.markdown("### Modalidade")
@@ -1509,7 +1321,7 @@ with st.sidebar:
                  "stop apertado — mais sinais, porém mais vulnerável a ruído do candle seguinte.",
         )
         min_score_to_log = st.slider(
-            "Score mínimo para recomendar", min_value=0, max_value=100, value=60, step=5,
+            "Score mínimo para registrar no histórico", min_value=0, max_value=100, value=55, step=5,
             help="Recomendações confirmadas abaixo deste score aparecem na tela, mas não entram no "
                  "Histórico de Sinais — evita misturar sinal fraco com forte nas estatísticas.",
         )
@@ -1517,23 +1329,17 @@ with st.sidebar:
         rsi_os_default, rsi_ob_default = getattr(
             daytrade_smc, "STYLE_RSI_THRESHOLDS", {}
         ).get(style, (10.0, 90.0))
-        # O slider de intervalo devolve a tupla em ordem CRESCENTE:
-        # (menor, maior) = (sobrevenda, sobrecompra). Nomear na ordem
-        # certa aqui é essencial — estas duas variáveis são repassadas
-        # posicionalmente para as funções de cache, e uma troca aqui
-        # invertia os limiares na análise inteira (IFR 65 aparecia como
-        # "exaustão vendedora → compra").
-        rsi_os, rsi_ob = st.slider(
+        rsi_ob, rsi_os = st.slider(
             "Limiares do IFR (sobrevenda / sobrecompra)", min_value=0, max_value=100,
             value=(int(rsi_os_default), int(rsi_ob_default)), step=5,
             key=f"rsi_thresholds_{style}",
             help=f"Padrão para {style}: {rsi_os_default:.0f}/{rsi_ob_default:.0f}. "
-                 "Compra só abaixo do primeiro valor; venda só acima do segundo. "
-                 "Em 10/90 o IFR dispara raramente — 20/80 gera mais sinais.",
+                 "Atenção: em 10/90 o IFR dispara MUITO raramente — se quiser mais sinais, "
+                 "20/80 ou 30/70 são alternativas.",
         )
         daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-        daytrade_smc.RSI_OVERSOLD = float(rsi_os)
-        daytrade_smc.RSI_OVERBOUGHT = float(rsi_ob)
+        daytrade_smc.RSI_OVERSOLD = float(rsi_ob)
+        daytrade_smc.RSI_OVERBOUGHT = float(rsi_os)
 
     if mode == "Análise individual":
         st.markdown("### Atualização")
@@ -1549,6 +1355,7 @@ with st.sidebar:
 # ========================================================================
 # Corpo principal
 # ========================================================================
+st.title("📊 Day Trade SMC — Análise Técnica")
 _agora = pd.Timestamp.now(tz="America/Sao_Paulo")
 _pregao = _agora.weekday() < 5 and 10 <= _agora.hour < 18
 _fonte_viva = source == "MetaTrader 5" and st.session_state.get("mt5_available")
@@ -1574,18 +1381,6 @@ if not _fonte_viva and source == "Yahoo Finance":
         f'15-20 minutos.</span> <span style="color:{COLORS["muted"]};font-size:0.84rem">'
         f'Use para viés e estrutura — tendência, níveis, força relativa. Confirme o preço de '
         f'execução no MetaTrader ou na tela da corretora antes de entrar.</span></div>',
-        unsafe_allow_html=True,
-    )
-
-if _RECURSOS_AUSENTES:
-    st.markdown(
-        f'<div class="card accent-sell">'
-        f'<div class="eyebrow">Arquivos fora de sincronia</div>'
-        f'<div style="font-size:0.92rem">O <code>daytrade_smc.py</code> em uso é de uma versão '
-        f'anterior à do <code>streamlit_app.py</code>. Alguns recursos estão desligados.</div>'
-        f'<div style="color:{COLORS["muted"]};font-size:0.84rem;margin-top:7px">'
-        f'Faltando: <code>{", ".join(_RECURSOS_AUSENTES)}</code><br>'
-        f'Atualize os <b>dois</b> arquivos juntos — eles mudam em conjunto.</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1617,22 +1412,29 @@ elif mode == "Scanner (todos os ativos)":
         confirmadas = result_df[result_df["OK"] == "✅"] if "OK" in result_df else result_df.iloc[0:0]
         n_compra = int((confirmadas["Direção"] == "COMPRA").sum()) if len(confirmadas) else 0
         n_venda = int((confirmadas["Direção"] == "VENDA").sum()) if len(confirmadas) else 0
-        n_fracas = int((result_df["OK"] == "~").sum()) if "OK" in result_df else 0
+        n_exaustao = int((result_df["Exaustão"] != "").sum()) if "Exaustão" in result_df else 0
         n_erro = int((result_df["OK"] == "⚠️").sum()) if "OK" in result_df else 0
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Recomendações", len(confirmadas), f"de {len(result_df)} ativos")
+        c1.metric("Confirmadas", len(confirmadas), f"de {len(result_df)} ativos")
         c2.metric("Compra", n_compra)
         c3.metric("Venda", n_venda)
-        c4.metric("Score baixo", n_fracas, f"abaixo de {min_score_to_log:.0f}")
+        c4.metric("Com exaustão IFR", n_exaustao)
         if n_erro:
             st.caption(f"⚠️ {n_erro} ativo(s) falharam na busca — veja a coluna Setup.")
 
         # --- Filtros rápidos ---
-        so_confirmadas = st.checkbox(f"Só recomendações (score ≥ {min_score_to_log:.0f})", value=False, key="scan_f_conf")
+        f1, f2 = st.columns([1, 1])
+        with f1:
+            so_confirmadas = st.checkbox("Só confirmadas", value=False, key="scan_f_conf")
+        with f2:
+            so_exaustao = st.checkbox("Só com exaustão de IFR", value=False, key="scan_f_exa")
+
         view = result_df
         if so_confirmadas and "OK" in view:
             view = view[view["OK"] == "✅"]
+        if so_exaustao and "Exaustão" in view:
+            view = view[view["Exaustão"] != ""]
 
         if view.empty:
             st.warning("Nenhum ativo atende aos filtros selecionados.")
@@ -1645,6 +1447,13 @@ elif mode == "Scanner (todos os ativos)":
                 if val == "ERRO":
                     return "color: #f0b429"
                 return "color: #8291a1"
+
+            def _color_exaustao(val):
+                if not val:
+                    return ""
+                # Alinhamento em 2+ timeframes é o sinal mais seletivo:
+                # destaca mais forte que o de 1 timeframe.
+                return "font-weight: 700" if "🎯" in str(val) else "color: #f0b429"
 
             def _color_ifr(val):
                 if pd.isna(val):
@@ -1659,6 +1468,7 @@ elif mode == "Scanner (todos os ativos)":
             styler = (
                 view.style
                 .map(_color_direction, subset=["Direção"])
+                .map(_color_exaustao, subset=["Exaustão"])
                 .map(_color_ifr, subset=ifr_cols)
             )
 
@@ -1666,9 +1476,10 @@ elif mode == "Scanner (todos os ativos)":
             # relance — bem mais rápido que comparar números soltos.
             col_cfg = {
                 "Ativo": st.column_config.TextColumn("Ativo", width="small", pinned=True),
-                "OK": st.column_config.TextColumn("OK", width="small", help="✅ recomendado · ~ confirmado mas score baixo · — sem confirmação"),
+                "OK": st.column_config.TextColumn("OK", width="small", help="✅ = os dois timeframes de confirmação concordam"),
                 "Direção": st.column_config.TextColumn("Direção", width="small"),
                 "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f", width="medium"),
+                "Exaustão": st.column_config.TextColumn("Exaustão IFR", width="small", help="Timeframes em exaustão simultânea na mesma direção"),
                 "Entrada": st.column_config.NumberColumn("Entrada", format="R$ %.2f", width="small"),
                 "Stop": st.column_config.NumberColumn("Stop", format="R$ %.2f", width="small"),
                 "Alvo 1": st.column_config.NumberColumn("Alvo 1", format="R$ %.2f", width="small"),
@@ -1682,7 +1493,7 @@ elif mode == "Scanner (todos os ativos)":
                 height=min(560, 45 + 35 * len(view)), column_config=col_cfg,
             )
             st.caption(
-                f"Ordenado por recomendação e score · 🌟 = oportunidade excepcional · "
+                f"Ordenado por confirmação e score · 🌟 = oportunidade excepcional · "
                 f"IFR colorido nos extremos ({rsi_os:.0f}/{rsi_ob:.0f}) · "
                 f"🎯 = exaustão em 2+ timeframes"
             )

@@ -100,14 +100,8 @@ SYMBOL_ALIASES = {
 # Preferimos sempre o CONTÍNUO (WIN$N e variantes): ele emenda os
 # vencimentos automaticamente, então o histórico não quebra na
 # virada do contrato.
-# Contrato em uso, fixado explicitamente. Futuros trocam de código a
-# cada vencimento (letra do mês + ano): V = outubro, 26 = 2026. Na
-# virada, basta trocar WINFUT_SYMBOL aqui.
-WINFUT_SYMBOL = "WINV26"
-# Reservas: se o contrato fixado não existir nesta corretora (ou já
-# tiver vencido), o app cai para o contínuo em vez de falhar.
-WINFUT_CANDIDATES = (WINFUT_SYMBOL, "WIN$N", "WIN$", "WIN$D", "WINFUT", "WIN")
-WINFUT_LABEL = WINFUT_SYMBOL
+WINFUT_CANDIDATES = ("WIN$N", "WIN$", "WIN$D", "WINFUT", "WIN")
+WINFUT_LABEL = "WINFUT"
 _WINFUT_RESOLVED: str | None = None
 
 
@@ -384,54 +378,6 @@ GITHUB_BRIDGE_TOKEN: str | None = None
 # risco por operação maior.
 MIN_STOP_ATR_MULT: float = 1.0
 
-# Configuração de leituras por estilo de operação.
-#
-# `rsi_filter`: se o IFR age como filtro de reversão na Confluência.
-#   Desligado no Swing porque, em Diário/Semanal, extremos de IFR são
-#   raros e o filtro acabava derrubando o score de boas oportunidades
-#   sem contrapartida — sobravam pouquíssimas recomendações.
-#   A leitura de IFR continua VISÍVEL como painel próprio; ela só
-#   deixa de interferir no score.
-#
-# `weights`: peso de cada leitura direcional na Confluência.
-#   No Swing, o VWAP é EXCLUÍDO (peso zero) por um motivo técnico: o
-#   VWAP reinicia a cada sessão, e no Diário cada candle já É uma
-#   sessão — o cálculo degenera para o preço típico do próprio candle,
-#   ficando sempre colado no preço. Ou seja, no Diário/Semanal ele não
-#   mede nada, e o peso dele é redistribuído para SMC e Price Action,
-#   que continuam válidos em qualquer prazo.
-STYLE_CONFIG = {
-    "Day Trade": {
-        "rsi_filter": True,
-        "weights": {"SMC": 32.0, "Price Action": 22.0, "Médias Móveis": 22.0, "VWAP": 24.0},
-    },
-    "Swing Trade": {
-        "rsi_filter": False,
-        "weights": {"SMC": 42.0, "Price Action": 34.0, "Médias Móveis": 24.0, "VWAP": 0.0},
-    },
-    "WINFUT": {
-        "rsi_filter": True,
-        "weights": {"SMC": 32.0, "Price Action": 22.0, "Médias Móveis": 22.0, "VWAP": 24.0},
-    },
-}
-
-# Estilo ativo. Definido pelo app antes de cada análise; o motor lê
-# daqui para saber quais pesos e filtros aplicar.
-ACTIVE_STYLE: str = "Day Trade"
-
-# Ajuste de realismo dos alvos.
-#
-# Na prática, boa parte das operações não percorre a distância cheia
-# até o alvo teórico — o preço reverte antes. Encurtar o alvo em 15%
-# aumenta a taxa de acerto (o alvo fica mais alcançável), e aumentar a
-# quantidade em 15% compensa o lucro menor por ação, mantendo o
-# retorno financeiro por operação aproximadamente igual.
-#
-# O STOP não é afetado: encurtar alvo já reduz o retorno/risco teórico,
-# e mexer no stop junto distorceria o dimensionamento do risco.
-TARGET_SHRINK = 0.85      # alvos a 85% da distância original
-QUANTITY_BOOST = 1.15     # 15% a mais de ações/contratos
-
 # Limiares do IFR para sobrecompra / sobrevenda. O padrão aqui é
 # 90/10 (extremos verdadeiros), não os convencionais 70/30.
 #
@@ -658,13 +604,13 @@ def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
 
     # "WINFUT" é um apelido: o código real varia por corretora e por
     # vencimento, então resolvemos na hora (com cache).
-    if symbol.upper() in (WINFUT_LABEL, WINFUT_SYMBOL, "WINFUT", "WIN", "MINI-INDICE", "MINI ÍNDICE"):
+    if symbol.upper() in (WINFUT_LABEL, "WIN", "MINI-INDICE", "MINI ÍNDICE"):
         resolvido = resolve_winfut_symbol()
         if resolvido is None:
             raise RuntimeError(
-                f"O contrato {WINFUT_SYMBOL} não foi encontrado nesta conta MT5, nem os contratos "
-                "contínuos de reserva. Rode `python diagnostico_mt5.py` para ver quais códigos a "
-                "sua corretora disponibiliza."
+                "Nenhum contrato de mini índice (WINFUT) encontrado nesta conta MT5. "
+                "Rode `python diagnostico_mt5.py` para ver quais códigos a sua corretora "
+                "disponibiliza."
             )
         symbol = resolvido
 
@@ -1542,10 +1488,7 @@ def rsi_signal(context: MarketContext) -> Signal:
     """
     reasons: list[str] = []
     rsi = context.rsi
-    # Ordenar aqui torna a inversão impossível, venha de onde vier a
-    # configuração: sobrevenda é, por definição, o limiar mais baixo.
-    oversold = min(RSI_OVERSOLD, RSI_OVERBOUGHT)
-    overbought = max(RSI_OVERSOLD, RSI_OVERBOUGHT)
+    overbought, oversold = RSI_OVERBOUGHT, RSI_OVERSOLD
 
     if rsi <= oversold:
         direction, score = Direction.BUY, 100.0
@@ -1598,39 +1541,23 @@ def confluence_signal(
     context: MarketContext,
     isolated: list[Signal],
 ) -> Signal:
-    """
-    Combina as leituras. O IFR NÃO participa da votação de direção —
-    ele age depois, como FILTRO DE REVERSÃO.
-
-    A razão é conceitual: as outras quatro leituras dizem para onde o
-    mercado está indo. O IFR em extremo diz o contrário — que o
-    movimento atual se esgotou. Se ele votasse junto, um ativo
-    despencando com IFR em 8 teria a leitura de queda (SMC, Médias,
-    VWAP apontando VENDA) anulada pelo voto de COMPRA do IFR, e o
-    resultado seria neutro: o sistema ficaria cego justamente no ponto
-    de reversão, que é onde o setup existe.
-
-    Então o IFR entra depois da direção decidida:
-      · aponta na MESMA direção  -> reforça (a reversão que ele sinaliza
-        é para onde as outras leituras já apontam)
-      · aponta CONTRA            -> derruba o score (as outras leituras
-        seguem a tendência, mas ela está exaurida — é o momento errado
-        de entrar a favor dela)
-    """
-    # Pesos e uso do filtro de IFR variam por estilo (ver STYLE_CONFIG).
-    cfg = STYLE_CONFIG.get(ACTIVE_STYLE, STYLE_CONFIG["Day Trade"])
-    weights = cfg["weights"]
-    usar_filtro_rsi = cfg["rsi_filter"]
-
+    # Pesos rebalanceados com a entrada do IFR como 5ª categoria. SMC
+    # segue como leitura de maior peso (estrutura manda); o IFR entra
+    # com peso menor que as demais de propósito — é excelente como
+    # GATILHO de timing, mas sozinho não define direção de mercado.
+    weights = {
+        "SMC": 26.0,
+        "Price Action": 18.0,
+        "Médias Móveis": 18.0,
+        "VWAP": 18.0,
+        "IFR": 15.0,
+    }
     buy = 0.0
     sell = 0.0
+    agreeing = 0
     reasons: list[str] = []
-    rsi_signal_obj = next((s for s in isolated if s.name == "IFR"), None)
-    # Leituras com peso zero saem da conta (ex: VWAP no Swing, que não
-    # tem significado em candles diários).
-    direcionais = [s for s in isolated if s.name != "IFR" and weights.get(s.name, 0) > 0]
 
-    for signal in direcionais:
+    for signal in isolated:
         normalized_strength = min(signal.score / 79.0, 1.0)
         points = weights[signal.name] * normalized_strength
         if signal.direction == Direction.BUY:
@@ -1652,46 +1579,15 @@ def confluence_signal(
     else:
         direction, score = Direction.SELL, sell
 
-    # --- IFR como filtro de reversão, aplicado após a direção ---
-    if usar_filtro_rsi and rsi_signal_obj is not None and rsi_signal_obj.direction != Direction.NEUTRAL:
-        if direction == Direction.NEUTRAL:
-            # Sem direção definida pelas outras leituras, a exaustão
-            # passa a ser o próprio sinal: é o caso clássico de
-            # reversão pura, sem tendência estabelecida contra.
-            direction = rsi_signal_obj.direction
-            score = max(score, 62.0)
-            reasons.insert(0, f"IFR: {rsi_signal_obj.reasons[0]} — exaustão define a direção")
-        elif rsi_signal_obj.direction == direction:
-            score = min(100.0, score * 1.30)
-            reasons.insert(0, f"IFR CONFIRMA a reversão: {rsi_signal_obj.reasons[0]}")
-        else:
-            score *= 0.45
-            reasons.insert(
-                0,
-                f"IFR ALERTA: extremo oposto ({context.rsi:.0f}) — o movimento atual está "
-                f"exaurido, entrar a favor dele agora é entrar no fim do movimento",
-            )
-
-    agreeing = sum(signal.direction == direction for signal in direcionais)
-    # Multiplicador por concordância. Como o número de leituras ativas
-    # muda por estilo (o Swing não usa VWAP), a escala é calculada em
-    # PROPORÇÃO das leituras válidas, não em contagem absoluta — senão
-    # 3 de 3 no Swing receberia o mesmo prêmio de 3 de 4 no Day Trade.
-    total_direcionais = len(direcionais)
-    if total_direcionais:
-        proporcao = agreeing / total_direcionais
-        if proporcao >= 0.99:
-            multiplier = 1.15
-        elif proporcao >= 0.74:
-            multiplier = 1.05
-        elif proporcao >= 0.49:
-            multiplier = 0.92
-        else:
-            multiplier = 0.60
-    else:
-        multiplier = 0.60
+    agreeing = sum(signal.direction == direction for signal in isolated)
+    # Multiplicador por número de categorias concordando. Recalibrado
+    # para 5 categorias (entrada do IFR): antes o teto era 4 e o valor
+    # 1.10 premiava a unanimidade. Mantida a mesma filosofia — 2
+    # categorias em 0.95 dá margem real sem abrir mão do critério, e a
+    # unanimidade das 5 recebe o prêmio máximo.
+    multiplier = {0: 0.60, 1: 0.60, 2: 0.90, 3: 1.0, 4: 1.08, 5: 1.15}[agreeing]
     score = min(100.0, score * multiplier)
-    confidence = agreeing / total_direcionais * 100 if total_direcionais else 0.0
+    confidence = agreeing / len(isolated) * 100 if isolated else 0.0
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1711,13 +1607,11 @@ def confluence_signal(
         direction == Direction.SELL and context.bearish_retest
     ):
         setup = "Rompimento + Reteste"
-    elif context.vwap_rejection and weights.get("VWAP", 0) > 0:
+    elif context.vwap_rejection:
         setup = "Pullback na VWAP"
     elif context.fvg_setup:
         setup = "FVG + Retorno"
-    elif usar_filtro_rsi and any(
-        s.name == "IFR" and s.direction == direction and s.score >= 79 for s in isolated
-    ):
+    elif any(s.name == "IFR" and s.direction == direction and s.score >= 79 for s in isolated):
         setup = "Exaustão de IFR"
     elif event and event.direction == direction:
         setup = "Continuação de tendência (BOS)"
@@ -1898,8 +1792,8 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry + risk * 1.5 * TARGET_SHRINK, "ceil")
-        target_2 = round_tick(entry + risk * 3.0 * TARGET_SHRINK, "ceil")
+        target_1 = round_tick(entry + risk * 1.5, "ceil")
+        target_2 = round_tick(entry + risk * 3.0, "ceil")
     else:
         if stop - entry < minimum_distance:
             stop = entry + minimum_distance
@@ -1909,8 +1803,8 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry - risk * 1.5 * TARGET_SHRINK, "floor")
-        target_2 = round_tick(entry - risk * 3.0 * TARGET_SHRINK, "floor")
+        target_1 = round_tick(entry - risk * 1.5, "floor")
+        target_2 = round_tick(entry - risk * 3.0, "floor")
 
     alternatives = alternative_targets(
         context,
@@ -1999,18 +1893,14 @@ def rsi_extremes_across_timeframes(mtf: "MultiTimeframeResult") -> dict:
     compra: list[str] = []
     venda: list[str] = []
 
-    # Mesma proteção do rsi_signal: sobrevenda é sempre o menor limiar.
-    oversold = min(RSI_OVERSOLD, RSI_OVERBOUGHT)
-    overbought = max(RSI_OVERSOLD, RSI_OVERBOUGHT)
-
     for tf, resultado in mtf.results.items():
         if resultado.context is None:
             continue
         valor = resultado.context.rsi
-        if valor <= oversold:
+        if valor <= RSI_OVERSOLD:
             por_tf[tf] = (valor, Direction.BUY.value)
             compra.append(tf)
-        elif valor >= overbought:
+        elif valor >= RSI_OVERBOUGHT:
             por_tf[tf] = (valor, Direction.SELL.value)
             venda.append(tf)
         else:
@@ -2512,7 +2402,7 @@ def print_signal(signal: Signal, symbol: str, risk_budget: float | None) -> None
         )
 
         if risk_budget is not None and risk_per_share > 0:
-            quantity = int((risk_budget // risk_per_share) * QUANTITY_BOOST)
+            quantity = int(risk_budget // risk_per_share)
             print(
                 f"  Para risco máximo de R$ {risk_budget:.2f}: "
                 f"{quantity} ação(ões), risco estimado R$ "
