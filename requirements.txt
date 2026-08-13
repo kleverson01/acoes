@@ -1,6 +1,23 @@
-pandas>=2.2
-numpy>=1.26
+# Versões FIXADAS, não faixas abertas ("pandas>=2.2" e afins).
+#
+# Duas razões concretas, ambas descobertas depurando esta máquina:
+#
+# 1. CPU sem x86-64-v2. Os wheels de numpy >= 2.1 e pandas >= 2.2 pra
+#    Windows exigem instruções (SSE4.2/POPCNT) que processadores
+#    anteriores a ~2009 não têm. O import não dá erro Python: derruba
+#    o processo inteiro sem mensagem (código -1073741795 / 0xC000001D).
+#
+# 2. Plotly 6.x com Streamlit. O componente de gráfico do Streamlit
+#    falha ao carregar o módulo JS ("Failed to fetch dynamically
+#    imported module: PlotlyChart...js") em certas combinações com o
+#    Plotly 6. O par abaixo é estável.
+#
+# Ou seja: faixa aberta aqui não é flexibilidade, é uma quebra à espera
+# do próximo `pip install`.
+
+numpy==1.26.4
+pandas==2.1.4
+plotly==5.24.1
+streamlit==1.38.0
 yfinance>=0.2.40
-streamlit>=1.38
-plotly>=5.22
 requests>=2.31

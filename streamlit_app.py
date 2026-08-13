@@ -367,8 +367,12 @@ portao_de_acesso()
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-    daytrade_smc.RSI_OVERSOLD = rsi_os
-    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
+    # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
+    # troca de ordem em qualquer ponto da cadeia inverta a leitura do
+    # IFR silenciosamente — bug que já ocorreu e é difícil de notar,
+    # porque o app continua funcionando, só que com o sinal ao contrário.
+    daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
+    daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance")
 
@@ -376,8 +380,12 @@ def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], co
 @st.cache_data(ttl=3, show_spinner=False)
 def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-    daytrade_smc.RSI_OVERSOLD = rsi_os
-    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
+    # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
+    # troca de ordem em qualquer ponto da cadeia inverta a leitura do
+    # IFR silenciosamente — bug que já ocorreu e é difícil de notar,
+    # porque o app continua funcionando, só que com o sinal ao contrário.
+    daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
+    daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5")
 
@@ -385,8 +393,12 @@ def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], cont
 @st.cache_data(ttl=10, show_spinner=False)
 def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-    daytrade_smc.RSI_OVERSOLD = rsi_os
-    daytrade_smc.RSI_OVERBOUGHT = rsi_ob
+    # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
+    # troca de ordem em qualquer ponto da cadeia inverta a leitura do
+    # IFR silenciosamente — bug que já ocorreu e é difícil de notar,
+    # porque o app continua funcionando, só que com o sinal ao contrário.
+    daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
+    daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)")
 
@@ -588,9 +600,14 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) 
         if risk_budget:
             risk_per_share = abs(risk.entry - risk.stop)
             if risk_per_share > 0:
-                qty = int(risk_budget // risk_per_share)
+                # +15% sobre o dimensionamento teórico: compensa o
+                # alvo encurtado em 15%, mantendo o retorno financeiro
+                # por operação aproximadamente igual.
+                boost = getattr(daytrade_smc, "QUANTITY_BOOST", 1.0)
+                qty = int((risk_budget // risk_per_share) * boost)
                 st.caption(f"Com risco de R$ {risk_budget:.2f}: **{qty} ações** · "
-                          f"risco real R$ {qty*risk_per_share:.2f} · total R$ {qty*risk.entry:.2f}")
+                          f"risco real R$ {qty*risk_per_share:.2f} · total R$ {qty*risk.entry:.2f}"
+                          + (f" · inclui +{(boost-1)*100:.0f}% de ajuste" if boost != 1.0 else ""))
 
         if risk.alternatives:
             st.markdown("**Possibilidades de saída:**")
@@ -966,8 +983,9 @@ def render_rsi_multi_tf(mtf) -> None:
     if not por_tf:
         return
 
-    ob = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
-    os_ = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
+    _a = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
+    _b = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
+    os_, ob = min(_a, _b), max(_a, _b)
     n, direcao = resumo["alinhamento"], resumo["direcao"]
 
     if n >= 1:
@@ -1011,8 +1029,9 @@ def render_rsi_multi_tf(mtf) -> None:
 def render_rsi_badge(context) -> None:
     """Trilho de IFR do prazo atual, com o diário como referência."""
     rsi = context.rsi
-    ob = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
-    os_ = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
+    _a = getattr(daytrade_smc, "RSI_OVERBOUGHT", 90.0)
+    _b = getattr(daytrade_smc, "RSI_OVERSOLD", 10.0)
+    os_, ob = min(_a, _b), max(_a, _b)
 
     if rsi <= os_:
         estado, cor, classe = "EXAUSTÃO VENDEDORA → COMPRA", COLORS["buy"], "accent-signal"
@@ -1139,7 +1158,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             err = (result_a.error or result_b.error or "")[:60]
             rows.append({"Ativo": symbol, "OK": "⚠️", "Direção": "ERRO", "Score": None,
                         col_a: None, col_b: None, f"IFR {tf_a}": None, "IFR D1": None,
-                        "Exaustão": "", "Entrada": None, "Stop": None, "Alvo 1": None,
+                        "Entrada": None, "Stop": None, "Alvo 1": None,
                         "Setup": err})
             if source != "MetaTrader 5":
                 time.sleep(0.3)
@@ -1179,30 +1198,20 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
         d1_result = mtf.results.get("D1")
         rsi_d1 = round(d1_result.context.rsi, 1) if (d1_result and d1_result.context) else None
 
-        # Quantos timeframes estão em exaustão simultânea na mesma
-        # direção — é o filtro mais seletivo que o IFR oferece aqui.
-        consolidar_rsi = getattr(daytrade_smc, "rsi_extremes_across_timeframes", None)
-        resumo_rsi = consolidar_rsi(mtf) if consolidar_rsi else {"alinhamento": 0, "direcao": None}
-        n_extremos = resumo_rsi["alinhamento"]
-        if n_extremos >= 2:
-            seta = "🟢↓" if resumo_rsi["direcao"] == Direction.BUY.value else "🔴↑"
-            exaustao = f"🎯 {n_extremos} TFs {seta}"
-        elif n_extremos == 1:
-            seta = "↓" if resumo_rsi["direcao"] == Direction.BUY.value else "↑"
-            exaustao = f"1 TF {seta}"
-        else:
-            exaustao = ""
+        # Recomendado = confirmado nos dois prazos E score acima do
+        # piso. Sem o piso, ativos com confirmação fraca apareciam com
+        # o mesmo destaque dos fortes.
+        recomendado = mtf.confirmed and score_geral >= min_score_to_log
 
         rows.append({
             "Ativo": ("🌟 " if destaque else "") + symbol,
-            "OK": "✅" if mtf.confirmed else "—",
+            "OK": "✅" if recomendado else ("~" if mtf.confirmed else "—"),
             "Direção": direction_label,
             "Score": score_geral,
             col_a: score_a,
             col_b: score_b,
             f"IFR {tf_a}": rsi_tf,
             "IFR D1": rsi_d1,
-            "Exaustão": exaustao,
             "Entrada": round(risk.entry, 2) if risk and risk.entry else None,
             "Stop": round(risk.stop, 2) if risk and risk.stop else None,
             "Alvo 1": round(risk.target_1, 2) if risk and risk.target_1 else None,
@@ -1219,7 +1228,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
         # diretamente: ela guarda símbolos ("✅", "—", "⚠️") e a ordem
         # alfabética deles não corresponde à prioridade desejada. Por
         # isso usamos uma coluna auxiliar numérica, descartada em seguida.
-        result["_ordem"] = result["OK"].map({"✅": 0, "—": 1, "⚠️": 2}).fillna(3)
+        result["_ordem"] = result["OK"].map({"✅": 0, "~": 1, "—": 2, "⚠️": 3}).fillna(4)
         result = result.sort_values(["_ordem", "Score"], ascending=[True, False], na_position="last")
         result = result.drop(columns="_ordem").reset_index(drop=True)
     return result
@@ -1415,7 +1424,7 @@ with st.sidebar:
                  "stop apertado — mais sinais, porém mais vulnerável a ruído do candle seguinte.",
         )
         min_score_to_log = st.slider(
-            "Score mínimo para registrar no histórico", min_value=0, max_value=100, value=55, step=5,
+            "Score mínimo para recomendar", min_value=0, max_value=100, value=60, step=5,
             help="Recomendações confirmadas abaixo deste score aparecem na tela, mas não entram no "
                  "Histórico de Sinais — evita misturar sinal fraco com forte nas estatísticas.",
         )
@@ -1423,17 +1432,23 @@ with st.sidebar:
         rsi_os_default, rsi_ob_default = getattr(
             daytrade_smc, "STYLE_RSI_THRESHOLDS", {}
         ).get(style, (10.0, 90.0))
-        rsi_ob, rsi_os = st.slider(
+        # O slider de intervalo devolve a tupla em ordem CRESCENTE:
+        # (menor, maior) = (sobrevenda, sobrecompra). Nomear na ordem
+        # certa aqui é essencial — estas duas variáveis são repassadas
+        # posicionalmente para as funções de cache, e uma troca aqui
+        # invertia os limiares na análise inteira (IFR 65 aparecia como
+        # "exaustão vendedora → compra").
+        rsi_os, rsi_ob = st.slider(
             "Limiares do IFR (sobrevenda / sobrecompra)", min_value=0, max_value=100,
             value=(int(rsi_os_default), int(rsi_ob_default)), step=5,
             key=f"rsi_thresholds_{style}",
             help=f"Padrão para {style}: {rsi_os_default:.0f}/{rsi_ob_default:.0f}. "
-                 "Atenção: em 10/90 o IFR dispara MUITO raramente — se quiser mais sinais, "
-                 "20/80 ou 30/70 são alternativas.",
+                 "Compra só abaixo do primeiro valor; venda só acima do segundo. "
+                 "Em 10/90 o IFR dispara raramente — 20/80 gera mais sinais.",
         )
         daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
-        daytrade_smc.RSI_OVERSOLD = float(rsi_ob)
-        daytrade_smc.RSI_OVERBOUGHT = float(rsi_os)
+        daytrade_smc.RSI_OVERSOLD = float(rsi_os)
+        daytrade_smc.RSI_OVERBOUGHT = float(rsi_ob)
 
     if mode == "Análise individual":
         st.markdown("### Atualização")
@@ -1518,29 +1533,22 @@ elif mode == "Scanner (todos os ativos)":
         confirmadas = result_df[result_df["OK"] == "✅"] if "OK" in result_df else result_df.iloc[0:0]
         n_compra = int((confirmadas["Direção"] == "COMPRA").sum()) if len(confirmadas) else 0
         n_venda = int((confirmadas["Direção"] == "VENDA").sum()) if len(confirmadas) else 0
-        n_exaustao = int((result_df["Exaustão"] != "").sum()) if "Exaustão" in result_df else 0
+        n_fracas = int((result_df["OK"] == "~").sum()) if "OK" in result_df else 0
         n_erro = int((result_df["OK"] == "⚠️").sum()) if "OK" in result_df else 0
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Confirmadas", len(confirmadas), f"de {len(result_df)} ativos")
+        c1.metric("Recomendações", len(confirmadas), f"de {len(result_df)} ativos")
         c2.metric("Compra", n_compra)
         c3.metric("Venda", n_venda)
-        c4.metric("Com exaustão IFR", n_exaustao)
+        c4.metric("Score baixo", n_fracas, f"abaixo de {min_score_to_log:.0f}")
         if n_erro:
             st.caption(f"⚠️ {n_erro} ativo(s) falharam na busca — veja a coluna Setup.")
 
         # --- Filtros rápidos ---
-        f1, f2 = st.columns([1, 1])
-        with f1:
-            so_confirmadas = st.checkbox("Só confirmadas", value=False, key="scan_f_conf")
-        with f2:
-            so_exaustao = st.checkbox("Só com exaustão de IFR", value=False, key="scan_f_exa")
-
+        so_confirmadas = st.checkbox(f"Só recomendações (score ≥ {min_score_to_log:.0f})", value=False, key="scan_f_conf")
         view = result_df
         if so_confirmadas and "OK" in view:
             view = view[view["OK"] == "✅"]
-        if so_exaustao and "Exaustão" in view:
-            view = view[view["Exaustão"] != ""]
 
         if view.empty:
             st.warning("Nenhum ativo atende aos filtros selecionados.")
@@ -1553,13 +1561,6 @@ elif mode == "Scanner (todos os ativos)":
                 if val == "ERRO":
                     return "color: #f0b429"
                 return "color: #8291a1"
-
-            def _color_exaustao(val):
-                if not val:
-                    return ""
-                # Alinhamento em 2+ timeframes é o sinal mais seletivo:
-                # destaca mais forte que o de 1 timeframe.
-                return "font-weight: 700" if "🎯" in str(val) else "color: #f0b429"
 
             def _color_ifr(val):
                 if pd.isna(val):
@@ -1574,7 +1575,6 @@ elif mode == "Scanner (todos os ativos)":
             styler = (
                 view.style
                 .map(_color_direction, subset=["Direção"])
-                .map(_color_exaustao, subset=["Exaustão"])
                 .map(_color_ifr, subset=ifr_cols)
             )
 
@@ -1582,10 +1582,9 @@ elif mode == "Scanner (todos os ativos)":
             # relance — bem mais rápido que comparar números soltos.
             col_cfg = {
                 "Ativo": st.column_config.TextColumn("Ativo", width="small", pinned=True),
-                "OK": st.column_config.TextColumn("OK", width="small", help="✅ = os dois timeframes de confirmação concordam"),
+                "OK": st.column_config.TextColumn("OK", width="small", help="✅ recomendado · ~ confirmado mas score baixo · — sem confirmação"),
                 "Direção": st.column_config.TextColumn("Direção", width="small"),
                 "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f", width="medium"),
-                "Exaustão": st.column_config.TextColumn("Exaustão IFR", width="small", help="Timeframes em exaustão simultânea na mesma direção"),
                 "Entrada": st.column_config.NumberColumn("Entrada", format="R$ %.2f", width="small"),
                 "Stop": st.column_config.NumberColumn("Stop", format="R$ %.2f", width="small"),
                 "Alvo 1": st.column_config.NumberColumn("Alvo 1", format="R$ %.2f", width="small"),
@@ -1599,7 +1598,7 @@ elif mode == "Scanner (todos os ativos)":
                 height=min(560, 45 + 35 * len(view)), column_config=col_cfg,
             )
             st.caption(
-                f"Ordenado por confirmação e score · 🌟 = oportunidade excepcional · "
+                f"Ordenado por recomendação e score · 🌟 = oportunidade excepcional · "
                 f"IFR colorido nos extremos ({rsi_os:.0f}/{rsi_ob:.0f}) · "
                 f"🎯 = exaustão em 2+ timeframes"
             )
