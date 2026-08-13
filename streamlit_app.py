@@ -27,6 +27,14 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# set_page_config precisa ser o PRIMEIRO comando Streamlit do script —
+# antes de qualquer outro, inclusive de st.secrets. Ler os secrets com
+# o arquivo ausente emite um aviso que já conta como "primeiro
+# comando", e aí esta chamada falha com StreamlitAPIException.
+st.set_page_config(page_title="Terminal SMC · B3", page_icon="◆", layout="wide",
+                   initial_sidebar_state="expanded")
+
+
 import daytrade_smc
 
 # Núcleo estável: nomes que existem desde as primeiras versões do
@@ -97,12 +105,23 @@ _RECURSOS_AUSENTES = [
 # → Secrets no Streamlit Cloud, ou .streamlit/secrets.toml localmente).
 # Sem isso configurado, a fonte "GitHub (MT5 de casa)" dá erro claro em
 # vez de travar — ver README.
-try:
-    daytrade_smc.GITHUB_BRIDGE_REPO = st.secrets.get("github_repo")
-    daytrade_smc.GITHUB_BRIDGE_TOKEN = st.secrets.get("github_token")
-except Exception:
-    daytrade_smc.GITHUB_BRIDGE_REPO = None
-    daytrade_smc.GITHUB_BRIDGE_TOKEN = None
+def _ler_secret(chave: str):
+    """
+    Lê um secret sem quebrar quando o arquivo não existe.
+
+    `st.secrets` levanta exceção (e imprime um aviso na tela) quando
+    não há secrets.toml — situação normal em uso local. Este wrapper
+    silencia isso, porque nenhum dos secrets é obrigatório: a ponte
+    GitHub e a senha de acesso são opcionais.
+    """
+    try:
+        return st.secrets.get(chave)
+    except Exception:
+        return None
+
+
+daytrade_smc.GITHUB_BRIDGE_REPO = _ler_secret("github_repo")
+daytrade_smc.GITHUB_BRIDGE_TOKEN = _ler_secret("github_token")
 
 STYLES = {
     "Day Trade": {
@@ -124,9 +143,6 @@ STYLES = {
         "count_label": "Candles fechados (M5 e M15)",
     },
 }
-
-st.set_page_config(page_title="Terminal SMC · B3", page_icon="◆", layout="wide",
-                   initial_sidebar_state="expanded")
 
 # ========================================================================
 # Sistema visual
@@ -319,11 +335,7 @@ inject_theme()
 # `compare_digest` para não vazar informação pelo tempo de resposta.
 # ========================================================================
 def _senha_configurada():
-    try:
-        senha = st.secrets.get("app_password")
-    except Exception:
-        senha = None
-    return senha or os.environ.get("APP_PASSWORD") or None
+    return _ler_secret("app_password") or os.environ.get("APP_PASSWORD") or None
 
 
 def portao_de_acesso() -> None:
@@ -365,7 +377,7 @@ portao_de_acesso()
 # Dados / cache / análise
 # ========================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
+def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
     # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
     # troca de ordem em qualquer ponto da cadeia inverta a leitura do
@@ -373,12 +385,16 @@ def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], co
     # porque o app continua funcionando, só que com o sinal ao contrário.
     daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
     daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
+    # O estilo entra como PARÂMETRO (não só variável global) para fazer
+    # parte da chave do cache: sem isso, trocar de estilo devolveria o
+    # resultado calculado com os pesos do estilo anterior.
+    daytrade_smc.ACTIVE_STYLE = style
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance")
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
+def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
     # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
     # troca de ordem em qualquer ponto da cadeia inverta a leitura do
@@ -386,12 +402,16 @@ def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], cont
     # porque o app continua funcionando, só que com o sinal ao contrário.
     daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
     daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
+    # O estilo entra como PARÂMETRO (não só variável global) para fazer
+    # parte da chave do cache: sem isso, trocar de estilo devolveria o
+    # resultado calculado com os pesos do estilo anterior.
+    daytrade_smc.ACTIVE_STYLE = style
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5")
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
+def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
     daytrade_smc.MIN_STOP_ATR_MULT = min_stop_atr_mult
     # Sobrevenda é sempre o MENOR dos dois. Ordenar aqui impede que uma
     # troca de ordem em qualquer ponto da cadeia inverta a leitura do
@@ -399,11 +419,15 @@ def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], c
     # porque o app continua funcionando, só que com o sinal ao contrário.
     daytrade_smc.RSI_OVERSOLD = min(rsi_os, rsi_ob)
     daytrade_smc.RSI_OVERBOUGHT = max(rsi_os, rsi_ob)
+    # O estilo entra como PARÂMETRO (não só variável global) para fazer
+    # parte da chave do cache: sem isso, trocar de estilo devolveria o
+    # resultado calculado com os pesos do estilo anterior.
+    daytrade_smc.ACTIVE_STYLE = style
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)")
 
 
-def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float):
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, min_stop_atr_mult: float, rsi_os: float, rsi_ob: float, style: str):
     """
     Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
     rate limit); MetaTrader 5 direto usa 3s; GitHub (MT5 de casa) usa
@@ -419,10 +443,10 @@ def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: 
     segundos, resultado calculado com o valor antigo.
     """
     if source == "MetaTrader 5":
-        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
+        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob, style)
     if source == "GitHub (MT5 de casa)":
-        return _cached_mtf_github(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
-    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob)
+        return _cached_mtf_github(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob, style)
+    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, min_stop_atr_mult, rsi_os, rsi_ob, style)
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
@@ -941,7 +965,7 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
 
     fonte_label = "MT5 (tempo real)" if source == "MetaTrader 5" else "Yahoo Finance (atraso ~15-20min)"
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob, style)
 
     render_confirmation_badge(mtf, confirmation, symbol, style, source, min_score_to_log)
     render_rsi_multi_tf(mtf)
@@ -1150,7 +1174,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, min_stop_atr_mult, rsi_os, rsi_ob, style)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
@@ -1373,6 +1397,11 @@ with st.sidebar:
             help="Day Trade confirma em 15+60 minutos (posições no mesmo dia). "
                  "Swing Trade confirma em Diário+Semanal, com 240 minutos como contexto de entrada.",
         )
+        _cfg = getattr(daytrade_smc, "STYLE_CONFIG", {}).get(style)
+        if _cfg:
+            _ativas = [k for k, v in _cfg["weights"].items() if v > 0]
+            _nota = " · IFR não filtra" if not _cfg["rsi_filter"] else ""
+            st.caption(f"Decide por: {' · '.join(_ativas)}{_nota}")
     conf_a, conf_b = STYLES[style]["confirmation"]
 
     st.markdown("### Modalidade")
@@ -1464,7 +1493,6 @@ with st.sidebar:
 # ========================================================================
 # Corpo principal
 # ========================================================================
-st.title("📊 Day Trade SMC — Análise Técnica")
 _agora = pd.Timestamp.now(tz="America/Sao_Paulo")
 _pregao = _agora.weekday() < 5 and 10 <= _agora.hour < 18
 _fonte_viva = source == "MetaTrader 5" and st.session_state.get("mt5_available")

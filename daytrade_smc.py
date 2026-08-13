@@ -384,6 +384,41 @@ GITHUB_BRIDGE_TOKEN: str | None = None
 # risco por operação maior.
 MIN_STOP_ATR_MULT: float = 1.0
 
+# Configuração de leituras por estilo de operação.
+#
+# `rsi_filter`: se o IFR age como filtro de reversão na Confluência.
+#   Desligado no Swing porque, em Diário/Semanal, extremos de IFR são
+#   raros e o filtro acabava derrubando o score de boas oportunidades
+#   sem contrapartida — sobravam pouquíssimas recomendações.
+#   A leitura de IFR continua VISÍVEL como painel próprio; ela só
+#   deixa de interferir no score.
+#
+# `weights`: peso de cada leitura direcional na Confluência.
+#   No Swing, o VWAP é EXCLUÍDO (peso zero) por um motivo técnico: o
+#   VWAP reinicia a cada sessão, e no Diário cada candle já É uma
+#   sessão — o cálculo degenera para o preço típico do próprio candle,
+#   ficando sempre colado no preço. Ou seja, no Diário/Semanal ele não
+#   mede nada, e o peso dele é redistribuído para SMC e Price Action,
+#   que continuam válidos em qualquer prazo.
+STYLE_CONFIG = {
+    "Day Trade": {
+        "rsi_filter": True,
+        "weights": {"SMC": 32.0, "Price Action": 22.0, "Médias Móveis": 22.0, "VWAP": 24.0},
+    },
+    "Swing Trade": {
+        "rsi_filter": False,
+        "weights": {"SMC": 42.0, "Price Action": 34.0, "Médias Móveis": 24.0, "VWAP": 0.0},
+    },
+    "WINFUT": {
+        "rsi_filter": True,
+        "weights": {"SMC": 32.0, "Price Action": 22.0, "Médias Móveis": 22.0, "VWAP": 24.0},
+    },
+}
+
+# Estilo ativo. Definido pelo app antes de cada análise; o motor lê
+# daqui para saber quais pesos e filtros aplicar.
+ACTIVE_STYLE: str = "Day Trade"
+
 # Ajuste de realismo dos alvos.
 #
 # Na prática, boa parte das operações não percorre a distância cheia
@@ -1582,19 +1617,18 @@ def confluence_signal(
         seguem a tendência, mas ela está exaurida — é o momento errado
         de entrar a favor dela)
     """
-    # Pesos das quatro leituras direcionais. SMC segue com o maior:
-    # estrutura de mercado é o que dá contexto ao resto.
-    weights = {
-        "SMC": 32.0,
-        "Price Action": 22.0,
-        "Médias Móveis": 22.0,
-        "VWAP": 24.0,
-    }
+    # Pesos e uso do filtro de IFR variam por estilo (ver STYLE_CONFIG).
+    cfg = STYLE_CONFIG.get(ACTIVE_STYLE, STYLE_CONFIG["Day Trade"])
+    weights = cfg["weights"]
+    usar_filtro_rsi = cfg["rsi_filter"]
+
     buy = 0.0
     sell = 0.0
     reasons: list[str] = []
     rsi_signal_obj = next((s for s in isolated if s.name == "IFR"), None)
-    direcionais = [s for s in isolated if s.name != "IFR"]
+    # Leituras com peso zero saem da conta (ex: VWAP no Swing, que não
+    # tem significado em candles diários).
+    direcionais = [s for s in isolated if s.name != "IFR" and weights.get(s.name, 0) > 0]
 
     for signal in direcionais:
         normalized_strength = min(signal.score / 79.0, 1.0)
@@ -1619,7 +1653,7 @@ def confluence_signal(
         direction, score = Direction.SELL, sell
 
     # --- IFR como filtro de reversão, aplicado após a direção ---
-    if rsi_signal_obj is not None and rsi_signal_obj.direction != Direction.NEUTRAL:
+    if usar_filtro_rsi and rsi_signal_obj is not None and rsi_signal_obj.direction != Direction.NEUTRAL:
         if direction == Direction.NEUTRAL:
             # Sem direção definida pelas outras leituras, a exaustão
             # passa a ser o próprio sinal: é o caso clássico de
@@ -1639,11 +1673,25 @@ def confluence_signal(
             )
 
     agreeing = sum(signal.direction == direction for signal in direcionais)
-    # Multiplicador por concordância entre as QUATRO leituras
-    # direcionais (o IFR não vota — ver o filtro de reversão acima).
-    multiplier = {0: 0.60, 1: 0.60, 2: 0.92, 3: 1.05, 4: 1.15}[agreeing]
+    # Multiplicador por concordância. Como o número de leituras ativas
+    # muda por estilo (o Swing não usa VWAP), a escala é calculada em
+    # PROPORÇÃO das leituras válidas, não em contagem absoluta — senão
+    # 3 de 3 no Swing receberia o mesmo prêmio de 3 de 4 no Day Trade.
+    total_direcionais = len(direcionais)
+    if total_direcionais:
+        proporcao = agreeing / total_direcionais
+        if proporcao >= 0.99:
+            multiplier = 1.15
+        elif proporcao >= 0.74:
+            multiplier = 1.05
+        elif proporcao >= 0.49:
+            multiplier = 0.92
+        else:
+            multiplier = 0.60
+    else:
+        multiplier = 0.60
     score = min(100.0, score * multiplier)
-    confidence = agreeing / len(direcionais) * 100 if direcionais else 0.0
+    confidence = agreeing / total_direcionais * 100 if total_direcionais else 0.0
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1663,11 +1711,13 @@ def confluence_signal(
         direction == Direction.SELL and context.bearish_retest
     ):
         setup = "Rompimento + Reteste"
-    elif context.vwap_rejection:
+    elif context.vwap_rejection and weights.get("VWAP", 0) > 0:
         setup = "Pullback na VWAP"
     elif context.fvg_setup:
         setup = "FVG + Retorno"
-    elif any(s.name == "IFR" and s.direction == direction and s.score >= 79 for s in isolated):
+    elif usar_filtro_rsi and any(
+        s.name == "IFR" and s.direction == direction and s.score >= 79 for s in isolated
+    ):
         setup = "Exaustão de IFR"
     elif event and event.direction == direction:
         setup = "Continuação de tendência (BOS)"
