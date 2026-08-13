@@ -187,6 +187,17 @@ DIRECTION_COLOR = {
 
 
 def inject_theme() -> None:
+    # A tradução automática do navegador quebra apps React (Streamlit):
+    # ela troca os nós de texto do DOM, e o React depois tenta remover
+    # nós que já não estão onde ele registrou — erro "Failed to execute
+    # 'removeChild' on 'Node'". Como a interface já está em português,
+    # traduzir não traz ganho nenhum. As duas metatags abaixo pedem ao
+    # Google/Chrome e ao Bing/Edge que não traduzam esta página.
+    st.markdown(
+        '<meta name="google" content="notranslate">'
+        '<meta name="translate" content="no">',
+        unsafe_allow_html=True,
+    )
     st.markdown(f"""<style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
@@ -1293,12 +1304,12 @@ def _persist_watchlist() -> None:
 # ========================================================================
 with st.sidebar:
     st.markdown(
-        '<div style="font-family:Space Grotesk,sans-serif;font-size:1.24rem;font-weight:700;'
-        'letter-spacing:-0.03em;margin-bottom:2px">TERMINAL <span style="color:'
-        + COLORS["signal"] + '">SMC</span></div>'
-        '<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;letter-spacing:0.15em;'
-        'color:' + COLORS["muted"] + ';text-transform:uppercase;margin-bottom:16px">'
-        'SMC · Price Action · Médias · VWAP · IFR</div>',
+        f'<div style="font-family:Space Grotesk,sans-serif;font-size:1.24rem;font-weight:700;'
+        f'letter-spacing:-0.03em;margin-bottom:2px">TERMINAL '
+        f'<span style="color:{COLORS["signal"]}">SMC</span></div>'
+        f'<div style="font-family:JetBrains Mono,monospace;font-size:0.6rem;letter-spacing:0.15em;'
+        f'color:{COLORS["muted"]};text-transform:uppercase;margin-bottom:16px">'
+        f'SMC · Price Action · Médias · VWAP · IFR</div>',
         unsafe_allow_html=True,
     )
 
