@@ -19,6 +19,8 @@ Rodar pela internet sem instalar nada: ver README.md.
 
 from __future__ import annotations
 
+import hmac
+import os
 import time
 
 import pandas as pd
@@ -26,6 +28,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import daytrade_smc
+
+# Núcleo estável: nomes que existem desde as primeiras versões do
+# motor. Se algum destes faltar, o app realmente não tem como rodar.
 from daytrade_smc import (
     ALL_MODALITIES_OPTION,
     DATA_SOURCES,
@@ -39,21 +44,54 @@ from daytrade_smc import (
     SWING_CONTEXT_TIMEFRAMES,
     analyze_symbol_mtf,
     check_signal_as_of,
-    clear_signal_log,
-    delete_signal_log_entry,
-    fetch_snapshot_timestamp,
-    load_signal_log,
     load_symbols,
-    log_signal,
     overall_agreement,
     overall_direction,
     overall_score,
     quality,
-    refresh_signal_log,
-    request_mt5_update,
     save_symbols,
     yahoo_symbol,
 )
+
+
+# Recursos adicionados depois (histórico de sinais, ponte MT5, WINFUT).
+# Resolvidos por getattr em vez de `from ... import`, porque um import
+# rígido quebra o app INTEIRO com ImportError quando só um dos dois
+# arquivos é atualizado no deploy — situação comum ao editar pelo
+# navegador do GitHub. Assim, o recurso indisponível simplesmente
+# desliga, e o resto continua de pé.
+def _opcional(nome, padrao=None):
+    return getattr(daytrade_smc, nome, padrao)
+
+
+def _faltando(*_a, **_k):
+    raise RuntimeError(
+        "Este recurso exige uma versão mais nova do daytrade_smc.py. "
+        "Atualize os DOIS arquivos (daytrade_smc.py e streamlit_app.py) juntos."
+    )
+
+
+clear_signal_log = _opcional("clear_signal_log", lambda: None)
+delete_signal_log_entry = _opcional("delete_signal_log_entry", lambda *_: None)
+load_signal_log = _opcional("load_signal_log", lambda: [])
+log_signal = _opcional("log_signal", lambda *a, **k: None)
+refresh_signal_log = _opcional("refresh_signal_log", lambda *a, **k: [])
+fetch_snapshot_timestamp = _opcional("fetch_snapshot_timestamp", lambda: None)
+request_mt5_update = _opcional(
+    "request_mt5_update",
+    lambda: (False, "Recurso indisponível nesta versão do daytrade_smc.py."),
+)
+
+# Recursos ausentes viram uma lista que a interface consulta pra avisar
+# o usuário uma única vez, em vez de falhar silenciosamente.
+_RECURSOS_AUSENTES = [
+    nome for nome in (
+        "load_signal_log", "log_signal", "refresh_signal_log",
+        "mt5_is_available", "rsi_extremes_across_timeframes",
+        "resolve_winfut_symbol", "WINFUT_CONFIRMATION_TIMEFRAMES",
+    )
+    if not hasattr(daytrade_smc, nome)
+]
 
 # Configura a ponte GitHub a partir dos secrets do Streamlit (Settings
 # → Secrets no Streamlit Cloud, ou .streamlit/secrets.toml localmente).
@@ -81,8 +119,8 @@ STYLES = {
     # ações ele é só contexto), porque o WIN gira rápido demais para
     # esperar o fechamento do M15 como gatilho único.
     "WINFUT": {
-        "confirmation": daytrade_smc.WINFUT_CONFIRMATION_TIMEFRAMES,
-        "context": daytrade_smc.WINFUT_CONTEXT_TIMEFRAMES,
+        "confirmation": _opcional("WINFUT_CONFIRMATION_TIMEFRAMES", ("M5", "M15")),
+        "context": _opcional("WINFUT_CONTEXT_TIMEFRAMES", ("H1", "D1")),
         "count_label": "Candles fechados (M5 e M15)",
     },
 }
@@ -265,6 +303,62 @@ hr {{ border-color:var(--line); }}
 
 
 inject_theme()
+
+
+# ========================================================================
+# Portão de acesso
+#
+# Só entra em ação se houver senha configurada em
+# .streamlit/secrets.toml (chave `app_password`) ou na variável de
+# ambiente APP_PASSWORD. Sem senha definida, o app abre direto — é o
+# comportamento certo para uso local, onde a única forma de chegar até
+# ele é já estar na máquina.
+#
+# A senha existe para o acesso remoto: publicado por um túnel, o app
+# fica alcançável por quem tiver a URL. Comparação com
+# `compare_digest` para não vazar informação pelo tempo de resposta.
+# ========================================================================
+def _senha_configurada():
+    try:
+        senha = st.secrets.get("app_password")
+    except Exception:
+        senha = None
+    return senha or os.environ.get("APP_PASSWORD") or None
+
+
+def portao_de_acesso() -> None:
+    senha_certa = _senha_configurada()
+    if not senha_certa or st.session_state.get("_autenticado"):
+        return
+
+    _, meio, _ = st.columns([1, 1.5, 1])
+    with meio:
+        st.markdown(
+            f'<div style="text-align:center;padding:52px 0 20px 0">'
+            f'<div style="font-family:Space Grotesk,sans-serif;font-size:1.9rem;font-weight:700;'
+            f'letter-spacing:-0.03em">TERMINAL <span style="color:{COLORS["signal"]}">SMC</span></div>'
+            f'<div style="font-family:JetBrains Mono,monospace;font-size:0.64rem;'
+            f'letter-spacing:0.16em;color:{COLORS["muted"]};text-transform:uppercase;margin-top:6px">'
+            f'Acesso restrito</div></div>',
+            unsafe_allow_html=True,
+        )
+        tentativa = st.text_input("Senha", type="password", key="_senha_input",
+                                  label_visibility="collapsed", placeholder="Senha de acesso")
+        if st.button("Entrar", type="primary", use_container_width=True):
+            if hmac.compare_digest(str(tentativa), str(senha_certa)):
+                st.session_state._autenticado = True
+                st.rerun()
+            else:
+                st.markdown(
+                    f'<div style="color:{COLORS["sell"]};font-size:0.84rem;text-align:center;'
+                    f'margin-top:10px">Senha incorreta.</div>',
+                    unsafe_allow_html=True,
+                )
+    st.stop()
+
+
+portao_de_acesso()
+
 
 
 # ========================================================================
@@ -673,7 +767,7 @@ def render_winfut(style: str, modality: str, source: str, count: int, risk_budge
         unsafe_allow_html=True,
     )
 
-    render_individual_analysis(daytrade_smc.WINFUT_LABEL, style, modality, source, count,
+    render_individual_analysis(_opcional("WINFUT_LABEL", "WINFUT"), style, modality, source, count,
                                risk_budget, min_stop_atr_mult, min_score_to_log, rsi_os, rsi_ob)
 
 
@@ -1381,6 +1475,18 @@ if not _fonte_viva and source == "Yahoo Finance":
         f'15-20 minutos.</span> <span style="color:{COLORS["muted"]};font-size:0.84rem">'
         f'Use para viés e estrutura — tendência, níveis, força relativa. Confirme o preço de '
         f'execução no MetaTrader ou na tela da corretora antes de entrar.</span></div>',
+        unsafe_allow_html=True,
+    )
+
+if _RECURSOS_AUSENTES:
+    st.markdown(
+        f'<div class="card accent-sell">'
+        f'<div class="eyebrow">Arquivos fora de sincronia</div>'
+        f'<div style="font-size:0.92rem">O <code>daytrade_smc.py</code> em uso é de uma versão '
+        f'anterior à do <code>streamlit_app.py</code>. Alguns recursos estão desligados.</div>'
+        f'<div style="color:{COLORS["muted"]};font-size:0.84rem;margin-top:7px">'
+        f'Faltando: <code>{", ".join(_RECURSOS_AUSENTES)}</code><br>'
+        f'Atualize os <b>dois</b> arquivos juntos — eles mudam em conjunto.</div></div>',
         unsafe_allow_html=True,
     )
 
