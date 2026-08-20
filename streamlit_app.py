@@ -33,6 +33,8 @@ from daytrade_smc import (
     DAYTRADE_CONTEXT_TIMEFRAMES,
     DEFAULT_SYMBOLS,
     Direction,
+    LEGACY_SYMBOLS,
+    TRADING_WINDOWS_LABEL,
     MODALITY_CHOICES,
     Signal,
     SWING_CONFIRMATION_TIMEFRAMES,
@@ -42,6 +44,7 @@ from daytrade_smc import (
     WINFUT_SYMBOL,
     analyze_symbol_mtf,
     check_signal_as_of,
+    compute_market_bias,
     fetch_snapshot_timestamp,
     load_symbols,
     overall_agreement,
@@ -49,6 +52,7 @@ from daytrade_smc import (
     overall_score,
     quality,
     save_symbols,
+    trading_window_status,
     trigger_github_update,
     yahoo_symbol,
 )
@@ -89,25 +93,53 @@ DIRECTION_COLOR = {
 # ========================================================================
 # Dados / cache / análise
 # ========================================================================
-@st.cache_data(ttl=60, show_spinner=False)
-def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+FILTER_KEYS = ("enforce_window", "window_ok", "enforce_bias", "bias_dir")
+
+
+def _mtf(symbol, count, confirmation, context, modality, source, filters):
     counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance")
+    return analyze_symbol_mtf(
+        symbol, confirmation=confirmation, context=context, counts=counts,
+        modality=modality, source=source,
+        enforce_window=filters[0], window_ok=filters[1],
+        enforce_bias=filters[2], bias_direction=filters[3],
+        bias_label=filters[4],
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, filters: tuple):
+    return _mtf(symbol, count, confirmation, context, modality, "Yahoo Finance", filters)
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
-    counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5")
+def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, filters: tuple):
+    return _mtf(symbol, count, confirmation, context, modality, "MetaTrader 5", filters)
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
-    counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)")
+def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, filters: tuple):
+    return _mtf(symbol, count, confirmation, context, modality, "GitHub (MT5 de casa)", filters)
 
 
-def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str):
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_market_bias(source: str, count: int = 200):
+    """Viés do IBOV (ponto 2). Cacheado por 60s — é o mesmo pra todos os ativos."""
+    return compute_market_bias(source=source, count=count)
+
+
+def current_filters() -> tuple:
+    """Empacota os filtros ativos num tuple hashável (pro cache do Streamlit)."""
+    return (
+        st.session_state.get("filter_window", True),
+        st.session_state.get("_window_ok", True),
+        st.session_state.get("filter_bias", True),
+        st.session_state.get("_bias_dir", "NEUTRO"),
+        st.session_state.get("_bias_label", ""),
+    )
+
+
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, filters: tuple | None = None):
     """
     Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
     rate limit); MetaTrader 5 direto usa 3s; GitHub (MT5 de casa) usa
@@ -117,11 +149,12 @@ def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: 
     evita o bug de identidade de widget no React já corrigido antes
     neste projeto.
     """
+    filters = filters or current_filters()
     if source == "MetaTrader 5":
-        return _cached_mtf_mt5(symbol, count, confirmation, context, modality)
+        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, filters)
     if source == "GitHub (MT5 de casa)":
-        return _cached_mtf_github(symbol, count, confirmation, context, modality)
-    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality)
+        return _cached_mtf_github(symbol, count, confirmation, context, modality, filters)
+    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, filters)
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
@@ -325,6 +358,62 @@ TIMEFRAME_LABELS = {
 }
 
 
+def render_filter_badges(mtf) -> None:
+    """Mostra o estado dos filtros de janela de operação e viés do IBOV."""
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if not st.session_state.get("filter_window", True):
+            st.caption(f"⏰ Filtro de janela DESLIGADO ({TRADING_WINDOWS_LABEL})")
+        elif mtf.window_ok:
+            st.success(f"⏰ {mtf.window_note}", icon="✅")
+        else:
+            st.error(f"⏰ {mtf.window_note} Sinais bloqueados.", icon="⛔")
+
+    with col2:
+        label = mtf.bias_label or "IBOV não medido"
+        if not st.session_state.get("filter_bias", True):
+            st.caption("📉 Filtro de viés do IBOV DESLIGADO")
+        elif mtf.bias_direction == Direction.BUY:
+            st.success(f"📈 {label} — só COMPRA liberada (vendas bloqueadas)", icon="📈")
+        elif mtf.bias_direction == Direction.SELL:
+            st.error(f"📉 {label} — só VENDA liberada (compras bloqueadas)", icon="📉")
+        else:
+            st.info(f"➖ {label} — sem bloqueio direcional", icon="➖")
+
+    if mtf.blocked_reasons:
+        st.warning("Filtros aplicados: " + " · ".join(mtf.blocked_reasons))
+
+
+def render_flow_panel(context) -> None:
+    """Painel de fluxo do ativo (ponto 4)."""
+    flow = context.flow
+    st.markdown("### 💧 Fluxo do ativo")
+    if not flow.has_volume:
+        st.caption("Sem dado de volume nesta fonte — fluxo não avaliado.")
+        return
+
+    color = DIRECTION_COLOR[flow.bias]
+    st.markdown(
+        f'<div style="border:1px solid {color}; border-radius:8px; padding:10px 14px; '
+        f'background:{color}18; margin-bottom:10px;">'
+        f'<b style="color:{color}">{flow.label}</b> — força {flow.strength:.0f}/100'
+        f'{" · 🚨 VOLUME ANORMAL" if flow.spike else ""}'
+        f'</div>', unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("RVOL", f"{flow.rvol:.2f}x", help="Volume do candle ÷ média dos últimos 20")
+    c2.metric("Vol. mesmo horário", f"{flow.intraday_ratio:.2f}x" if flow.intraday_ratio else "—",
+              help="Volume atual vs. o MESMO horário nos dias anteriores")
+    c3.metric("Delta da sessão", f"{flow.session_delta_pct:+.1f}%",
+              help="Pressão compradora (+) ou vendedora (-) acumulada no dia")
+    c4.metric("MFI (14)", f"{flow.mfi:.0f}", help="Money Flow Index — fluxo financeiro")
+
+    for note in flow.notes:
+        st.caption(f"• {note}")
+
+
 def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
     tf_a, tf_b = confirmation
     result_a = mtf.results[tf_a]
@@ -445,6 +534,7 @@ def render_mtf_analysis(symbol: str, confirmation: tuple[str, str], context_tfs:
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
         mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source)
 
+    render_filter_badges(mtf)
     render_confirmation_badge(mtf, confirmation)
 
     tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] + (" (contexto)" if tf not in confirmation else "") for tf in all_tfs])
@@ -478,6 +568,8 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
         [s.name for s in signals], index=0, key=f"chart_choice_{timeframe}",
     )
     st.plotly_chart(build_chart(context, by_name[chart_choice], symbol), use_container_width=True, key=f"chart_{timeframe}_{chart_choice}")
+
+    render_flow_panel(context)
 
     tabs = st.tabs([s.name for s in signals])
     for tab, s in zip(tabs, signals):
@@ -564,6 +656,7 @@ _WINFUT_AUTO_REFRESH_FRAGMENTS = {
 
 def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None) -> pd.DataFrame:
     rows = []
+    filters = current_filters()
     progress = st.progress(0.0, text="Iniciando scanner...")
     confirmation = STYLES[style]["confirmation"]
     context_tfs = STYLES[style]["context"]
@@ -572,15 +665,15 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, filters)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
         if result_a.error or result_b.error:
             err = (result_a.error or result_b.error or "")[:60]
             rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Destaque": "", "Direção": "ERRO", col_a: None,
-                        col_b: None, "Score Geral": None, "Setup": err, "Entrada": None, "Stop": None,
-                        "Alvo 1": None, "Quantidade": None, "Total (R$)": None})
+                        col_b: None, "Score Geral": None, "Fluxo": "", "RVOL": None, "Setup": err,
+                        "Entrada": None, "Stop": None, "Alvo 1": None, "Quantidade": None, "Total (R$)": None})
             if source != "MetaTrader 5":
                 time.sleep(0.3)
             continue
@@ -615,6 +708,18 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
         score_geral = round((score_a + score_b) / 2, 1)
         destaque = "🌟 Excepcional" if (mtf.confirmed and quality(score_geral) == "OPORTUNIDADE EXCEPCIONAL") else ""
 
+        # Fluxo do ativo (ponto 4) — lido no timeframe de confirmação mais curto
+        flow = result_a.context.flow
+        if not flow.has_volume:
+            flow_label = "—"
+        else:
+            icon = {"COMPRA": "🟢", "VENDA": "🔴", "NEUTRO": "⚪"}[flow.bias.value]
+            flow_label = f"{icon} {flow.label.replace('FLUXO ', '')}"
+            if flow.spike:
+                flow_label = "🚨 " + flow_label
+            if mtf.confirmed and flow.bias != Direction.NEUTRAL and flow.bias == mtf.confirmed_direction:
+                destaque = (destaque + " 💧 Fluxo a favor").strip()
+
         rows.append({
             "Ativo": symbol,
             "Confirmado": "✅" if mtf.confirmed else "❌",
@@ -623,6 +728,8 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             col_a: score_a,
             col_b: score_b,
             "Score Geral": score_geral,
+            "Fluxo": flow_label,
+            "RVOL": round(flow.rvol, 2) if flow.has_volume else None,
             "Setup": setup_text,
             "Entrada": round(risk.entry, 2) if risk and risk.entry else None,
             "Stop": round(risk.stop, 2) if risk and risk.stop else None,
@@ -784,10 +891,49 @@ with st.sidebar:
             _persist_watchlist()
             st.rerun()
 
-        if st.button("Restaurar lista padrão", use_container_width=True):
-            st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
-            _persist_watchlist()
-            st.rerun()
+        col_a_btn, col_b_btn = st.columns(2)
+        with col_a_btn:
+            if st.button("Lista padrão", use_container_width=True,
+                         help=f"Restaura os {len(DEFAULT_SYMBOLS)} ativos monitorados"):
+                st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
+                _persist_watchlist()
+                st.rerun()
+        with col_b_btn:
+            if st.button("Lista antiga", use_container_width=True,
+                         help="Restaura a watchlist anterior (VALE3, PETR4, ...)"):
+                st.session_state.watchlist = LEGACY_SYMBOLS.copy()
+                _persist_watchlist()
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    # Filtros operacionais (pontos 1 e 2)
+    # ------------------------------------------------------------------
+    st.markdown("### Filtros operacionais")
+    intraday_mode = (mode == "Mini Índice (WINFUT)") or style == "Day Trade"
+
+    st.checkbox(
+        f"Só operar nas janelas {TRADING_WINDOWS_LABEL}",
+        value=intraday_mode, key="filter_window",
+        help="Fora dessas duas janelas os sinais são bloqueados (viram NEUTRO). "
+             "São os horários de maior volatilidade e assertividade do pregão. "
+             "Desmarque para estudar fora do horário ou para Swing Trade.",
+    )
+    window_ok, window_note = trading_window_status()
+    st.session_state["_window_ok"] = window_ok
+    st.caption(("🟢 " if window_ok else "🔴 ") + window_note)
+
+    st.checkbox(
+        "Bloquear operações contra o IBOV", value=True, key="filter_bias",
+        help="IBOV caindo → não sugere COMPRA. IBOV subindo → não sugere VENDA.",
+    )
+    bias = cached_market_bias(source)
+    st.session_state["_bias_dir"] = bias.direction.value
+    st.session_state["_bias_label"] = bias.label
+    if bias.error:
+        st.caption(f"⚠️ Viés do índice indisponível ({bias.symbol}) — nenhum bloqueio aplicado.")
+    else:
+        icon = {"COMPRA": "📈", "VENDA": "📉", "NEUTRO": "➖"}[bias.direction.value]
+        st.caption(f"{icon} **{bias.label}** ({bias.change_pct:+.2f}% na sessão · força {bias.score:+.0f})")
 
     st.markdown("### Parâmetros")
     st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "

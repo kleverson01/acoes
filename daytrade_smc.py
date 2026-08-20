@@ -33,6 +33,7 @@ import statistics
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import time as dt_time
 from enum import Enum
 from pathlib import Path
 
@@ -49,19 +50,45 @@ except ImportError as exc:
 
 
 LOCAL_TZ = "America/Sao_Paulo"
+
+# ------------------------------------------------------------------
+# Watchlist operacional (lista definida pelo operador). São os ativos
+# efetivamente monitorados no scanner. A lista antiga fica preservada
+# em LEGACY_SYMBOLS e pode ser recarregada pela interface.
+# ------------------------------------------------------------------
 DEFAULT_SYMBOLS = [
-    "VALE3",
-    "PETR4",
-    "PRIO3",
-    "ITUB4",
-    "BBAS3",
-    "BBDC4",
-    "B3SA3",
-    "WEGE3",
-    "ABEV3",
-    "MGLU3",
-    "BRA50",
+    "VIVT3", "ECOR3", "BRAP4", "MOTV3", "SANB11", "SMFT3", "CSMG3",
+    "EGIE3", "VBBR3", "RAIL3", "BEEF3", "UGPA3", "TIMS3", "TAEE11",
+    "HAPV3", "VAMO3", "PSSA3", "CXSE3", "CSAN3", "BRAV3", "AXIA3",
+    "AURE3", "RADL3",
 ]
+
+LEGACY_SYMBOLS = [
+    "VALE3", "PETR4", "PRIO3", "ITUB4", "BBAS3", "BBDC4",
+    "B3SA3", "WEGE3", "ABEV3", "MGLU3", "BRA50",
+]
+
+# ------------------------------------------------------------------
+# 1) Janela de operação — só analisa/valida sinais nos horários de
+#    maior volatilidade e assertividade do pregão brasileiro.
+# ------------------------------------------------------------------
+TRADING_WINDOWS: tuple[tuple[dt_time, dt_time], ...] = (
+    (dt_time(10, 0), dt_time(11, 30)),
+    (dt_time(13, 35), dt_time(16, 0)),
+)
+TRADING_WINDOWS_LABEL = " e ".join(
+    f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}" for a, b in TRADING_WINDOWS
+)
+
+# ------------------------------------------------------------------
+# 2) Viés do índice — IBOV caindo bloqueia COMPRA; IBOV subindo
+#    bloqueia VENDA. Símbolo usado pra medir o viés por fonte.
+# ------------------------------------------------------------------
+BIAS_SYMBOL_BY_SOURCE = {
+    "Yahoo Finance": "IBOV",        # ^BVSP via SYMBOL_ALIASES
+    "MetaTrader 5": "WINFUT",       # proxy em tempo real do índice
+    "GitHub (MT5 de casa)": "WINFUT",
+}
 SYMBOL_ALIASES = {
     "BRA50": "^BVSP",
     "IBOV": "^BVSP",
@@ -174,6 +201,30 @@ class StructureEvent:
 
 
 @dataclass
+class FlowMetrics:
+    """Leitura de fluxo/volume do ativo (ponto 4)."""
+    has_volume: bool = True
+    rvol: float = 0.0                 # volume do candle ÷ média de 20
+    volume_z: float = 0.0             # z-score do volume (quão fora do normal)
+    financial_last: float = 0.0       # volume financeiro do candle (R$)
+    financial_avg: float = 0.0        # média de 20 candles (R$)
+    session_financial: float = 0.0    # financeiro acumulado da sessão (R$)
+    intraday_ratio: float = 0.0       # volume vs. MESMO horário nos dias anteriores
+    candle_delta: float = 0.0         # pressão do candle (-1 vendedor … +1 comprador)
+    session_delta_pct: float = 0.0    # delta acumulado da sessão (% do volume da sessão)
+    cvd_slope_pct: float = 0.0        # inclinação do delta acumulado nos últimos candles
+    obv_slope_pct: float = 0.0        # inclinação do OBV
+    mfi: float = 50.0                 # Money Flow Index (14)
+    spike: bool = False               # volume anormal
+    absorption: bool = False          # muito volume, pouco preço → absorção
+    climax: bool = False              # volume + amplitude extremos → exaustão
+    bias: Direction = Direction.NEUTRAL
+    strength: float = 0.0             # 0–100
+    label: str = "FLUXO NEUTRO"
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class MarketContext:
     df: pd.DataFrame
     atr: float
@@ -197,6 +248,7 @@ class MarketContext:
     fvg_setup: str | None
     rsi: float
     rsi_series: pd.Series
+    flow: FlowMetrics = field(default_factory=FlowMetrics)
 
 
 @dataclass
@@ -828,6 +880,343 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+# ========================================================================
+# 4) FLUXO DO ATIVO — volume anormal, pressão compradora/vendedora
+# ========================================================================
+def _clip(value: float, low: float = -1.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def _signed_volume(df: pd.DataFrame) -> pd.Series:
+    """
+    Proxy de delta (agressão compradora - vendedora) a partir de OHLCV.
+    Sem book/times&trades, a posição do fechamento dentro do range é a
+    melhor aproximação disponível: fechou perto da máxima = comprador
+    dominou aquele candle; perto da mínima = vendedor dominou.
+    """
+    rng = (df["high"] - df["low"]).replace(0, np.nan)
+    pressure = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / rng
+    return pressure.fillna(0.0) * df["volume"].astype(float)
+
+
+def compute_mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    raw_flow = typical * df["volume"].astype(float)
+    delta = typical.diff()
+    positive = raw_flow.where(delta > 0, 0.0).rolling(period, min_periods=period // 2).sum()
+    negative = raw_flow.where(delta < 0, 0.0).rolling(period, min_periods=period // 2).sum()
+    ratio = positive / negative.replace(0, np.nan)
+    return (100 - 100 / (1 + ratio)).fillna(50.0)
+
+
+def compute_flow(df: pd.DataFrame, atr: float | None = None, lookback: int = 20) -> FlowMetrics:
+    """
+    Lê o fluxo do ativo: volume fora do normal, pressão compradora ou
+    vendedora acumulada, absorção e clímax. Serve pra responder
+    "tem dinheiro entrando nesse ativo agora?" antes de operar o setup.
+    """
+    flow = FlowMetrics()
+    volume = df["volume"].astype(float)
+
+    if volume.tail(lookback).sum() <= 0 or volume.isna().all():
+        flow.has_volume = False
+        flow.label = "SEM DADO DE VOLUME"
+        flow.notes.append("Fonte não fornece volume para este ativo — fluxo não avaliado.")
+        return flow
+
+    last_vol = float(volume.iloc[-1])
+    vol_ma = float(volume.rolling(lookback, min_periods=5).mean().iloc[-1])
+    vol_sd = float(volume.rolling(lookback, min_periods=5).std().iloc[-1] or 0.0)
+    flow.rvol = last_vol / vol_ma if vol_ma else 0.0
+    flow.volume_z = (last_vol - vol_ma) / vol_sd if vol_sd else 0.0
+
+    close = df["close"].astype(float)
+    financial = close * volume
+    flow.financial_last = float(financial.iloc[-1])
+    flow.financial_avg = float(financial.rolling(lookback, min_periods=5).mean().iloc[-1])
+
+    # --- sessão atual (delta acumulado do dia)
+    local_dates = pd.Series(df.index.tz_convert(LOCAL_TZ).date, index=df.index)
+    session_mask = (local_dates == local_dates.iloc[-1]).to_numpy()
+    signed = _signed_volume(df)
+    session_volume = float(volume[session_mask].sum())
+    if session_volume > 0 and session_mask.sum() > 1:
+        flow.session_delta_pct = float(signed[session_mask].sum()) / session_volume * 100
+        flow.session_financial = float(financial[session_mask].sum())
+
+    # --- CVD (delta acumulado) e OBV: inclinação recente
+    cvd = signed.cumsum()
+    window = min(10, len(df) - 1)
+    recent_volume = float(volume.tail(window).sum())
+    if recent_volume > 0:
+        flow.cvd_slope_pct = float(cvd.iloc[-1] - cvd.iloc[-window - 1]) / recent_volume * 100
+    obv = (np.sign(close.diff().fillna(0.0)) * volume).cumsum()
+    obv_ref = float(obv.tail(window + 1).abs().max() or 1.0)
+    flow.obv_slope_pct = float(obv.iloc[-1] - obv.iloc[-window - 1]) / obv_ref * 100
+
+    rng = float(df["high"].iloc[-1] - df["low"].iloc[-1])
+    flow.candle_delta = (
+        ((float(close.iloc[-1]) - float(df["low"].iloc[-1]))
+         - (float(df["high"].iloc[-1]) - float(close.iloc[-1]))) / rng
+        if rng > 0 else 0.0
+    )
+    flow.mfi = float(compute_mfi(df).iloc[-1])
+
+    # --- volume x MESMO horário dos dias anteriores (perfil intradiário).
+    # Comparar 10h30 com 10h30 é bem mais honesto que comparar com a
+    # média do dia inteiro: abertura e fechamento sempre têm mais volume.
+    times = pd.Series(df.index.tz_convert(LOCAL_TZ).time, index=df.index)
+    if local_dates.nunique() >= 3 and times.nunique() > 3:
+        same_slot = volume[(times == times.iloc[-1]).to_numpy() & ~session_mask]
+        if len(same_slot) >= 2 and same_slot.mean() > 0:
+            flow.intraday_ratio = last_vol / float(same_slot.mean())
+
+    # --- eventos de fluxo
+    flow.spike = flow.volume_z >= 2.0 or flow.rvol >= 2.0 or flow.intraday_ratio >= 2.0
+    if atr and atr > 0:
+        flow.absorption = flow.rvol >= 1.8 and rng <= 0.6 * atr
+        flow.climax = flow.rvol >= 2.5 and rng >= 1.8 * atr
+
+    # --- consolidação: -100 (vendedor) … +100 (comprador)
+    raw = (
+        _clip(flow.session_delta_pct / 25) * 35
+        + _clip(flow.cvd_slope_pct / 20) * 25
+        + _clip((flow.mfi - 50) / 30) * 20
+        + _clip(flow.candle_delta) * 12
+        + _clip(flow.obv_slope_pct / 50) * 8
+    )
+    volume_factor = max(0.55, min(1.35, flow.rvol if flow.rvol else 1.0))
+    strength = min(100.0, abs(raw) * volume_factor)
+
+    if raw >= 8:
+        flow.bias = Direction.BUY
+    elif raw <= -8:
+        flow.bias = Direction.SELL
+    else:
+        flow.bias = Direction.NEUTRAL
+        strength = min(strength, 35.0)
+    flow.strength = round(strength, 1)
+
+    if flow.bias == Direction.NEUTRAL:
+        flow.label = "FLUXO NEUTRO / INDEFINIDO"
+    else:
+        lado = "COMPRADOR" if flow.bias == Direction.BUY else "VENDEDOR"
+        grau = "FORTE" if strength >= 65 else "MODERADO" if strength >= 40 else "FRACO"
+        flow.label = f"FLUXO {lado} {grau}"
+
+    # --- leitura em texto (é isso que aparece no painel)
+    if flow.spike:
+        flow.notes.append(
+            f"VOLUME FORA DO NORMAL — {flow.rvol:.1f}x a média de 20 candles"
+            + (f" e {flow.intraday_ratio:.1f}x o mesmo horário dos dias anteriores" if flow.intraday_ratio else "")
+        )
+    elif flow.rvol >= 1.3:
+        flow.notes.append(f"Volume acima do normal ({flow.rvol:.1f}x a média)")
+    elif flow.rvol and flow.rvol < 0.7:
+        flow.notes.append(f"Volume fraco ({flow.rvol:.1f}x a média) — fluxo pouco confiável")
+
+    if flow.absorption:
+        flow.notes.append("ABSORÇÃO — volume alto com pouca variação de preço (alguém segurando a ponta)")
+    if flow.climax:
+        flow.notes.append("CLÍMAX DE VOLUME — movimento esticado, risco de exaustão/reversão")
+
+    if abs(flow.session_delta_pct) >= 8:
+        lado = "compradora" if flow.session_delta_pct > 0 else "vendedora"
+        flow.notes.append(f"Pressão {lado} dominante na sessão (delta {flow.session_delta_pct:+.1f}%)")
+    if abs(flow.cvd_slope_pct) >= 10:
+        lado = "entrando" if flow.cvd_slope_pct > 0 else "saindo"
+        flow.notes.append(f"Dinheiro {lado} nos últimos candles (delta acumulado {flow.cvd_slope_pct:+.1f}%)")
+    if flow.mfi >= 75:
+        flow.notes.append(f"MFI em {flow.mfi:.0f} — fluxo financeiro comprador esticado")
+    elif flow.mfi <= 25:
+        flow.notes.append(f"MFI em {flow.mfi:.0f} — fluxo financeiro vendedor esticado")
+
+    if flow.financial_last and flow.financial_avg:
+        flow.notes.append(
+            f"Financeiro do candle: R$ {flow.financial_last:,.0f} "
+            f"(média R$ {flow.financial_avg:,.0f})".replace(",", ".")
+        )
+
+    return flow
+
+
+# ========================================================================
+# 1) JANELA DE OPERAÇÃO
+# ========================================================================
+def now_local() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=LOCAL_TZ)
+
+
+def in_trading_window(ts: pd.Timestamp | None = None) -> bool:
+    """True se o horário está numa das janelas operacionais (dia útil)."""
+    ts = ts or now_local()
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(LOCAL_TZ)
+    else:
+        ts = ts.tz_convert(LOCAL_TZ)
+    if ts.weekday() >= 5:  # sábado/domingo
+        return False
+    current = ts.time()
+    return any(start <= current <= end for start, end in TRADING_WINDOWS)
+
+
+def trading_window_status(ts: pd.Timestamp | None = None) -> tuple[bool, str]:
+    """Retorna (dentro_da_janela, mensagem explicativa)."""
+    ts = ts or now_local()
+    ts = ts.tz_localize(LOCAL_TZ) if ts.tzinfo is None else ts.tz_convert(LOCAL_TZ)
+    hora = ts.strftime("%H:%M")
+
+    if ts.weekday() >= 5:
+        return False, f"Fim de semana ({hora}) — fora da janela de operação."
+    if in_trading_window(ts):
+        for start, end in TRADING_WINDOWS:
+            if start <= ts.time() <= end:
+                return True, (
+                    f"Dentro da janela {start.strftime('%H:%M')}–{end.strftime('%H:%M')} "
+                    f"(agora {hora})."
+                )
+    proximas = [s for s, _ in TRADING_WINDOWS if ts.time() < s]
+    if proximas:
+        return False, f"Fora da janela (agora {hora}) — próxima abre às {proximas[0].strftime('%H:%M')}."
+    return False, f"Fora da janela (agora {hora}) — janelas do dia encerradas ({TRADING_WINDOWS_LABEL})."
+
+
+# ========================================================================
+# 2) VIÉS DO ÍNDICE (IBOV)
+# ========================================================================
+@dataclass
+class MarketBias:
+    direction: Direction = Direction.NEUTRAL
+    label: str = "NEUTRO"
+    score: float = 0.0            # -100 (caindo forte) … +100 (subindo forte)
+    change_pct: float = 0.0       # variação da sessão
+    symbol: str = ""
+    timeframe: str = ""
+    reasons: list[str] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def blocks_buy(self) -> bool:
+        return self.direction == Direction.SELL
+
+    @property
+    def blocks_sell(self) -> bool:
+        return self.direction == Direction.BUY
+
+
+def compute_market_bias(
+    source: str = "Yahoo Finance",
+    timeframe: str = "M15",
+    count: int = 200,
+    symbol: str | None = None,
+) -> MarketBias:
+    """
+    Mede se o índice está subindo, caindo ou de lado, combinando VWAP,
+    EMAs, inclinação e variação da sessão. Se falhar (fonte sem o
+    símbolo, rate limit etc.), devolve NEUTRO — nunca trava a análise.
+    """
+    symbol = symbol or BIAS_SYMBOL_BY_SOURCE.get(source, "IBOV")
+    bias = MarketBias(symbol=symbol, timeframe=timeframe)
+    try:
+        df = fetch_ohlcv(symbol, timeframe, count, source=source)
+        if len(df) < 30:
+            raise ValueError("histórico insuficiente")
+    except Exception as exc:  # noqa: BLE001
+        bias.error = str(exc)
+        bias.label = "INDISPONÍVEL"
+        bias.reasons.append(f"Não foi possível medir o índice ({symbol}): {exc}")
+        return bias
+
+    close = df["close"].astype(float)
+    price = float(close.iloc[-1])
+    emas = compute_emas(df)
+    ema9 = float(emas["ema9"].iloc[-1])
+    ema21 = float(emas["ema21"].iloc[-1])
+    vwap_series = compute_daily_vwap(df)
+    vwap = float(vwap_series.iloc[-1])
+
+    local_dates = pd.Series(df.index.tz_convert(LOCAL_TZ).date, index=df.index)
+    session = close[(local_dates == local_dates.iloc[-1]).to_numpy()]
+    ref_open = float(session.iloc[0]) if len(session) > 1 else float(close.iloc[-2])
+    bias.change_pct = (price - ref_open) / ref_open * 100 if ref_open else 0.0
+
+    score = 0.0
+    if price > vwap:
+        score += 25
+        bias.reasons.append("Índice acima da VWAP do dia")
+    elif price < vwap:
+        score -= 25
+        bias.reasons.append("Índice abaixo da VWAP do dia")
+
+    if ema9 > ema21:
+        score += 20
+        bias.reasons.append("EMA9 acima da EMA21 (tendência curta de alta)")
+    elif ema9 < ema21:
+        score -= 20
+        bias.reasons.append("EMA9 abaixo da EMA21 (tendência curta de baixa)")
+
+    score += _clip(slope_pct(close, lookback=5) / 0.30) * 25
+    score += _clip(bias.change_pct / 0.80) * 30
+    bias.reasons.append(f"Variação da sessão: {bias.change_pct:+.2f}%")
+    bias.score = round(max(-100.0, min(100.0, score)), 1)
+
+    if bias.score >= 25:
+        bias.direction, bias.label = Direction.BUY, "IBOV SUBINDO"
+    elif bias.score <= -25:
+        bias.direction, bias.label = Direction.SELL, "IBOV CAINDO"
+    else:
+        bias.direction, bias.label = Direction.NEUTRAL, "IBOV LATERAL"
+    return bias
+
+
+def block_signal(signal: Signal, reason: str) -> None:
+    """Neutraliza um sinal bloqueado por filtro externo (janela/viés)."""
+    signal.direction = Direction.NEUTRAL
+    signal.score = min(signal.score, 39.0)
+    signal.confidence = min(signal.confidence, 30.0)
+    signal.setup = f"BLOQUEADO — {reason}"
+    signal.risk = RiskPlan()
+    if reason not in signal.alerts:
+        signal.alerts.insert(0, reason)
+
+
+def apply_external_filters(
+    signals: list[Signal],
+    window_ok: bool = True,
+    bias_direction: Direction = Direction.NEUTRAL,
+    enforce_window: bool = False,
+    enforce_bias: bool = False,
+) -> list[str]:
+    """
+    Aplica os filtros de janela de horário e de viés do índice sobre os
+    sinais já calculados. Devolve as razões de bloqueio aplicadas.
+    """
+    applied: list[str] = []
+
+    if enforce_window and not window_ok:
+        reason = f"FORA DA JANELA DE OPERAÇÃO ({TRADING_WINDOWS_LABEL})"
+        for signal in signals:
+            if signal.direction != Direction.NEUTRAL:
+                block_signal(signal, reason)
+        applied.append(reason)
+
+    if enforce_bias and bias_direction != Direction.NEUTRAL:
+        blocked = Direction.BUY if bias_direction == Direction.SELL else Direction.SELL
+        reason = (
+            "IBOV CAINDO — compras bloqueadas" if blocked == Direction.BUY
+            else "IBOV SUBINDO — vendas bloqueadas"
+        )
+        hit = False
+        for signal in signals:
+            if signal.direction == blocked:
+                block_signal(signal, reason)
+                hit = True
+        if hit:
+            applied.append(reason)
+
+    return applied
+
+
 def build_context(df: pd.DataFrame) -> MarketContext:
     if len(df) < 30:
         raise ValueError("São necessários pelo menos 30 candles fechados.")
@@ -887,6 +1276,7 @@ def build_context(df: pd.DataFrame) -> MarketContext:
         fvg_setup=detect_fvg_setup(df),
         rsi=rsi,
         rsi_series=rsi_series,
+        flow=compute_flow(df, atr=atr),
     )
 
 
@@ -1285,6 +1675,29 @@ def confluence_signal(
     else:
         direction, score = Direction.SELL, sell
 
+    # --- Fluxo do ativo (ponto 4): confirma ou desconta a leitura técnica.
+    # Setup bom com fluxo contrário costuma ser armadilha; setup bom com
+    # volume anormal a favor é o que realmente anda.
+    flow = context.flow
+    if flow.has_volume and direction != Direction.NEUTRAL and flow.bias != Direction.NEUTRAL:
+        if flow.bias == direction:
+            bonus = 4.0 + (flow.strength / 100) * 8.0
+            bonus += 3.0 if flow.spike else 0.0
+            if direction == Direction.BUY:
+                buy += bonus
+            else:
+                sell += bonus
+            score = max(buy, sell)
+            reasons.insert(0, f"Fluxo: {flow.label} a favor da direção (força {flow.strength:.0f}/100)")
+        else:
+            penalty = 6.0 + (flow.strength / 100) * 10.0
+            if direction == Direction.BUY:
+                buy = max(0.0, buy - penalty)
+            else:
+                sell = max(0.0, sell - penalty)
+            score = max(0.0, score - penalty)
+            reasons.insert(0, f"Fluxo: {flow.label} CONTRA a direção do setup")
+
     agreeing = sum(signal.direction == direction for signal in isolated)
     # O multiplicador de "2 categorias concordando" foi recalibrado de 0.85
     # para 0.95: com 0.85, o teto matemático desse cenário (quando só
@@ -1327,6 +1740,15 @@ def confluence_signal(
     alerts = market_alerts(context)
     if agreeing < 3:
         alerts.append("SINAIS CONFLITANTES — baixa confluência")
+    if flow.has_volume:
+        if direction != Direction.NEUTRAL and flow.bias != Direction.NEUTRAL and flow.bias != direction:
+            alerts.append(f"FLUXO CONTRÁRIO — {flow.label}")
+        if flow.climax:
+            alerts.append("CLÍMAX DE VOLUME — risco de exaustão do movimento")
+        if flow.absorption:
+            alerts.append("ABSORÇÃO DETECTADA — pode travar o movimento")
+        if flow.rvol and flow.rvol < 0.6:
+            alerts.append("VOLUME MUITO BAIXO — fluxo não sustenta a entrada")
 
     return Signal(
         "Confluência",
@@ -1591,6 +2013,11 @@ class MultiTimeframeResult:
     modality: str                  # qual leitura foi usada pra confirmação: Confluência, SMC, Price Action, Médias Móveis ou VWAP
     confirmed: bool               # True só se os dois timeframes de confirmação concordarem na mesma direção (nessa leitura)
     confirmed_direction: Direction
+    window_ok: bool = True                 # dentro da janela de operação?
+    window_note: str = ""                  # explicação da janela
+    bias_direction: Direction = Direction.NEUTRAL   # viés do IBOV usado no filtro
+    bias_label: str = ""
+    blocked_reasons: list[str] = field(default_factory=list)  # filtros que bloquearam sinais
 
 
 MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR")
@@ -1775,6 +2202,11 @@ def analyze_symbol_mtf(
     counts: dict[str, int] | None = None,
     modality: str = "Confluência",
     source: str = "Yahoo Finance",
+    enforce_window: bool = False,
+    window_ok: bool | None = None,
+    enforce_bias: bool = False,
+    bias_direction: Direction | str = Direction.NEUTRAL,
+    bias_label: str = "",
 ) -> MultiTimeframeResult:
     """
     Roda a análise nos timeframes de CONFIRMAÇÃO (obrigatórios — a
@@ -1841,6 +2273,33 @@ def analyze_symbol_mtf(
     if needs_h1_only_for_h4:
         results.pop("H1", None)  # H1 só foi buscado como dependência do H4, não foi pedido de verdade
 
+    # ------------------------------------------------------------------
+    # Filtros externos (janela de operação + viés do IBOV). Aplicados
+    # DEPOIS do cálculo e ANTES da confirmação: um sinal bloqueado vira
+    # NEUTRO e, portanto, nunca confirma nem gera plano de entrada.
+    # ------------------------------------------------------------------
+    if isinstance(bias_direction, str):
+        bias_direction = {
+            "COMPRA": Direction.BUY, "VENDA": Direction.SELL,
+        }.get(bias_direction.upper(), Direction.NEUTRAL)
+
+    if window_ok is None:
+        window_ok = in_trading_window()
+    _, window_note = trading_window_status()
+
+    blocked_reasons: list[str] = []
+    for tf_result in results.values():
+        if tf_result.signals:
+            for reason in apply_external_filters(
+                tf_result.signals,
+                window_ok=window_ok,
+                bias_direction=bias_direction,
+                enforce_window=enforce_window,
+                enforce_bias=enforce_bias,
+            ):
+                if reason not in blocked_reasons:
+                    blocked_reasons.append(reason)
+
     tf_a, tf_b = confirmation
     dir_a = _signal_direction(results[tf_a].signals, modality) if tf_a in results else None
     dir_b = _signal_direction(results[tf_b].signals, modality) if tf_b in results else None
@@ -1851,6 +2310,9 @@ def analyze_symbol_mtf(
     return MultiTimeframeResult(
         symbol=symbol, results=results, modality=modality,
         confirmed=confirmed, confirmed_direction=confirmed_direction,
+        window_ok=bool(window_ok), window_note=window_note,
+        bias_direction=bias_direction, bias_label=bias_label,
+        blocked_reasons=blocked_reasons,
     )
 
 
