@@ -1127,11 +1127,22 @@ def compute_market_bias(
         bias.reasons.append(f"Não foi possível medir o índice ({symbol}): {exc}")
         return bias
 
+    try:
+        return _market_bias_from_df(df, bias)
+    except Exception as exc:  # noqa: BLE001 — viés é acessório: nunca derruba o app
+        bias.error = str(exc)
+        bias.label = "INDISPONÍVEL"
+        bias.direction = Direction.NEUTRAL
+        bias.reasons.append(f"Falha ao calcular o viés do índice: {exc}")
+        return bias
+
+
+def _market_bias_from_df(df: pd.DataFrame, bias: MarketBias) -> MarketBias:
     close = df["close"].astype(float)
     price = float(close.iloc[-1])
     emas = compute_emas(df)
-    ema9 = float(emas["ema9"].iloc[-1])
-    ema21 = float(emas["ema21"].iloc[-1])
+    ema9 = float(emas["ema_9"].iloc[-1])
+    ema21 = float(emas["ema_21"].iloc[-1])
     vwap_series = compute_daily_vwap(df)
     vwap = float(vwap_series.iloc[-1])
 
@@ -1160,9 +1171,14 @@ def compute_market_bias(
     bias.reasons.append(f"Variação da sessão: {bias.change_pct:+.2f}%")
     bias.score = round(max(-100.0, min(100.0, score)), 1)
 
-    if bias.score >= 25:
+    # Zona morta: só declara direção com placar consistente E variação
+    # mínima da sessão. Sem isso, VWAP+EMAs (45 pontos) rotulam qualquer
+    # oscilação de ruído como tendência — e o filtro passaria o pregão
+    # inteiro bloqueando um dos lados sem motivo real.
+    directional = abs(bias.score) >= 35 and abs(bias.change_pct) >= 0.10
+    if directional and bias.score > 0:
         bias.direction, bias.label = Direction.BUY, "IBOV SUBINDO"
-    elif bias.score <= -25:
+    elif directional and bias.score < 0:
         bias.direction, bias.label = Direction.SELL, "IBOV CAINDO"
     else:
         bias.direction, bias.label = Direction.NEUTRAL, "IBOV LATERAL"
