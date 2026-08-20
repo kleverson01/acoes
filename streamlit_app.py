@@ -752,6 +752,99 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
     return result
 
 
+def run_opportunities(
+    symbols: list[str], style: str, source: str, count: int,
+    risk_budget: float | None, threshold: float = 75.0,
+    require_confirmation: bool = True,
+) -> pd.DataFrame:
+    """
+    Varre a watchlist e devolve SÓ o que está operável agora: qualquer
+    leitura (Confluência, SMC, Price Action, Médias, VWAP, IFR) com
+    score acima do corte e direção definida.
+
+    Sinais bloqueados pelos filtros (fora da janela de operação ou
+    contra o viés do IBOV) já chegam aqui como NEUTRO, então saem da
+    lista automaticamente — que é o comportamento desejado.
+    """
+    rows = []
+    filters = current_filters()
+    confirmation = STYLES[style]["confirmation"]
+    context_tfs = STYLES[style]["context"]
+    tf_a, tf_b = confirmation
+    progress = st.progress(0.0, text="Procurando oportunidades...")
+
+    for i, symbol in enumerate(symbols):
+        progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
+        try:
+            # Roda em "Todas as modalidades" pra ter as 6 leituras calculadas
+            mtf = cached_mtf(symbol, count, confirmation, context_tfs, ALL_MODALITIES_OPTION, source, filters)
+        except Exception:
+            continue
+
+        result_a, result_b = mtf.results.get(tf_a), mtf.results.get(tf_b)
+        if not result_a or result_a.error or not result_a.signals:
+            if source != "MetaTrader 5":
+                time.sleep(0.3)
+            continue
+
+        by_name_b = {sig.name: sig for sig in (result_b.signals or [])} if result_b and not result_b.error else {}
+        flow = result_a.context.flow
+
+        for sig in result_a.signals:
+            if sig.direction == Direction.NEUTRAL or sig.score < threshold:
+                continue
+
+            # A leitura precisa se sustentar também no timeframe maior:
+            # score alto só em M15 é ruído com frequência alta demais.
+            other = by_name_b.get(sig.name)
+            same_direction = bool(other and other.direction == sig.direction)
+            if require_confirmation and not same_direction:
+                continue
+
+            risk = sig.risk
+            qty = total = None
+            if risk_budget and risk.entry is not None and risk.stop is not None:
+                risk_per_share = abs(risk.entry - risk.stop)
+                if risk_per_share > 0:
+                    qty = int(risk_budget // risk_per_share)
+                    total = round(qty * risk.entry, 2) if qty > 0 else 0.0
+
+            if not flow.has_volume or flow.bias == Direction.NEUTRAL:
+                flow_tag = "⚪ neutro"
+            elif flow.bias == sig.direction:
+                flow_tag = f"🟢 a favor ({flow.strength:.0f})" if not flow.spike else f"🚨 a favor ({flow.strength:.0f})"
+            else:
+                flow_tag = f"🔴 contra ({flow.strength:.0f})"
+
+            rows.append({
+                "Ativo": symbol,
+                "Direção": sig.direction.value,
+                "Leitura": sig.name,
+                f"Score {tf_a}": round(sig.score, 1),
+                f"Score {tf_b}": round(other.score, 1) if other else None,
+                "Qualidade": quality(sig.score),
+                "Fluxo": flow_tag,
+                "RVOL": round(flow.rvol, 2) if flow.has_volume else None,
+                "Setup": sig.setup,
+                "Entrada": round(risk.entry, 2) if risk.entry else None,
+                "Stop": round(risk.stop, 2) if risk.stop else None,
+                "Alvo 1": round(risk.target_1, 2) if risk.target_1 else None,
+                "R:R": round(risk.rr, 2) if risk.rr else None,
+                "Quantidade": qty,
+                "Total (R$)": total,
+            })
+
+        if source != "MetaTrader 5":
+            time.sleep(0.3)
+
+    progress.empty()
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(f"Score {tf_a}", ascending=False).reset_index(drop=True)
+        df.insert(0, "#", range(1, len(df) + 1))
+    return df
+
+
 # ========================================================================
 # Estado inicial (ANTES da sidebar, pra widgets com `key` já nascerem
 # com o valor certo — evita o bug clássico do Streamlit de "mudei o
@@ -791,7 +884,8 @@ with st.sidebar:
 
     mode = st.radio(
         "Modo",
-        ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa", "Mini Índice (WINFUT)"],
+        ["🔥 Oportunidades agora", "Análise individual", "Scanner (todos os ativos)",
+         "Verificação retroativa", "Mini Índice (WINFUT)"],
         key="mode_select",
     )
 
@@ -952,6 +1046,24 @@ with st.sidebar:
         )
     elif mode == "Scanner (todos os ativos)":
         run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
+    elif mode == "🔥 Oportunidades agora":
+        st.markdown("### Critério de oportunidade")
+        opp_threshold = st.slider(
+            "Score mínimo", min_value=60, max_value=95, value=75, step=5,
+            help="Mostra qualquer leitura (Confluência, SMC, Price Action, Médias, VWAP ou IFR) "
+                 "com score acima deste corte.",
+        )
+        st.caption(
+            "⚠️ As leituras isoladas (SMC, Price Action, Médias, VWAP, IFR) são limitadas a "
+            "**79 pontos** pelo próprio motor — só a Confluência passa disso. Com corte acima "
+            "de 79 a lista mostra **apenas Confluência**."
+        )
+        opp_require_conf = st.checkbox(
+            "Exigir a mesma direção nos dois timeframes", value=True,
+            help=f"A leitura precisa apontar a mesma direção em {conf_a} e {conf_b}. "
+                 "Desmarcar aumenta MUITO o número de resultados — e o de falsos positivos.",
+        )
+        run_opp_clicked = st.button("🔥 Buscar oportunidades", type="primary", use_container_width=True)
 
 
 # ========================================================================
@@ -966,7 +1078,90 @@ st.warning(
     icon="⏱️",
 )
 
-if mode == "Análise individual":
+if mode == "🔥 Oportunidades agora":
+    window_ok_now, window_note_now = trading_window_status()
+    bias_now = cached_market_bias(source)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        (st.success if window_ok_now else st.error)(f"⏰ {window_note_now}")
+    with col2:
+        if bias_now.error:
+            st.info("➖ Viés do IBOV indisponível — nenhum bloqueio direcional")
+        elif bias_now.direction == Direction.BUY:
+            st.success(f"📈 {bias_now.label} ({bias_now.change_pct:+.2f}%) — só COMPRA liberada")
+        elif bias_now.direction == Direction.SELL:
+            st.error(f"📉 {bias_now.label} ({bias_now.change_pct:+.2f}%) — só VENDA liberada")
+        else:
+            st.info(f"➖ {bias_now.label} ({bias_now.change_pct:+.2f}%) — os dois lados liberados")
+
+    if st.session_state.get("filter_window", True) and not window_ok_now:
+        st.warning(
+            f"Fora da janela de operação ({TRADING_WINDOWS_LABEL}), todos os sinais são "
+            "bloqueados — a lista virá vazia. Desmarque o filtro na barra lateral se quiser "
+            "estudar o mercado assim mesmo."
+        )
+
+    st.caption(f"{len(st.session_state.watchlist)} ativos · {style} · confirmação {conf_a}+{conf_b} · "
+               f"{count} candles · fonte: {source}")
+
+    if run_opp_clicked:
+        st.session_state.opp_result = run_opportunities(
+            st.session_state.watchlist, style, source, count, risk_budget,
+            threshold=float(opp_threshold), require_confirmation=opp_require_conf,
+        )
+        st.session_state.opp_meta = (opp_threshold, opp_require_conf, pd.Timestamp.now(tz="America/Sao_Paulo"))
+        st.session_state.opp_risk_budget = risk_budget
+
+    if "opp_result" in st.session_state:
+        opp_df = st.session_state.opp_result
+        thr, req_conf, ran_at = st.session_state.get("opp_meta", (75, True, None))
+
+        if opp_df.empty:
+            st.info(
+                f"Nenhuma oportunidade acima de {thr} pontos no momento"
+                + (" (exigindo os dois timeframes na mesma direção)." if req_conf else ".")
+                + " Isso é informação, não falha: na maior parte do tempo o mercado não oferece "
+                "setup de alta qualidade. Rode de novo mais tarde ou baixe o corte."
+            )
+        else:
+            ativos = opp_df["Ativo"].nunique()
+            compras = int((opp_df["Direção"] == "COMPRA").sum())
+            vendas = int((opp_df["Direção"] == "VENDA").sum())
+            st.markdown(f"### {len(opp_df)} oportunidade(s) em {ativos} ativo(s) — "
+                        f"🟢 {compras} compra(s) · 🔴 {vendas} venda(s)")
+            if ran_at is not None:
+                st.caption(f"Varredura de {ran_at.strftime('%d/%m/%Y %H:%M:%S')} · corte {thr} pontos")
+
+            def _color_dir_opp(val):
+                if val == "COMPRA":
+                    return "color: #2ed3a3; font-weight: 600"
+                if val == "VENDA":
+                    return "color: #ff5470; font-weight: 600"
+                return "color: #8291a1"
+
+            st.dataframe(
+                opp_df.style.map(_color_dir_opp, subset=["Direção"]),
+                hide_index=True, use_container_width=True,
+                height=min(600, 45 + 35 * len(opp_df)),
+            )
+
+            if not st.session_state.get("opp_risk_budget"):
+                st.caption("Defina o **Risco máximo (R$)** na barra lateral pra ver a quantidade sugerida.")
+
+            st.markdown("#### Abrir análise completa")
+            pick = st.selectbox("Ativo", opp_df["Ativo"].unique().tolist(), key="opp_pick_select")
+            if st.button("Ver gráfico e as 6 leituras"):
+                if pick not in st.session_state.watchlist:
+                    st.session_state.watchlist.append(pick)
+                st.session_state.jump_to_symbol = pick
+                st.rerun()
+    else:
+        st.info("Clique em **🔥 Buscar oportunidades** na barra lateral. "
+                f"A varredura leva ~{max(1, len(st.session_state.watchlist) * 2 // 60)}-"
+                f"{max(2, len(st.session_state.watchlist) * 4 // 60)} min com {len(st.session_state.watchlist)} ativos no Yahoo Finance.")
+
+elif mode == "Análise individual":
     symbol = st.session_state.symbol_select
 
     if auto_refresh:

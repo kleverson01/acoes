@@ -57,10 +57,12 @@ LOCAL_TZ = "America/Sao_Paulo"
 # em LEGACY_SYMBOLS e pode ser recarregada pela interface.
 # ------------------------------------------------------------------
 DEFAULT_SYMBOLS = [
-    "VIVT3", "ECOR3", "BRAP4", "MOTV3", "SANB11", "SMFT3", "CSMG3",
-    "EGIE3", "VBBR3", "RAIL3", "BEEF3", "UGPA3", "TIMS3", "TAEE11",
-    "HAPV3", "VAMO3", "PSSA3", "CXSE3", "CSAN3", "BRAV3", "AXIA3",
-    "AURE3", "RADL3",
+    "MGLU3", "GOAU4", "GGBR4", "ABEV3", "VALE3", "SUZB3", "RENT3",
+    "ITUB4", "ITSA4", "PETR4", "WEGE3", "PRIO3", "USIM5", "BBDC4",
+    "CMIG4", "MRVE3", "B3SA3", "BBAS3", "AURE3", "AXIA3", "BEEF3",
+    "BRAP4", "BRAV3", "CSAN3", "CSMG3", "CXSE3", "ECOR3", "EGIE3",
+    "HAPV3", "MOTV3", "PSSA3", "RADL3", "RAIL3", "SANB11", "SMFT3",
+    "TAEE11", "TIMS3", "UGPA3", "VAMO3", "VBBR3", "VIVT3",
 ]
 
 LEGACY_SYMBOLS = [
