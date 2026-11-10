@@ -1,0 +1,9 @@
+{
+  "_comentario": "Gates novos do executor. Score mínimo por modalidade: [alta liquidez, baixa liquidez].",
+  "faixa_abertura": {"ativo": true, "inicio": "10:00", "minutos": 30, "timeframe_min": 15,
+                     "aplicar_em": ["Confluência", "VWAP", "SMC", "Médias Móveis", "Price Action"]},
+  "score_minimo": {"Confluência": [80, 85], "VWAP": [70, 75], "SMC": [80, 85],
+                   "Médias Móveis": [80, 85], "Price Action": [80, 85]},
+  "modo_inicial": {"VWAP": "PAPER"},
+  "rebaixamento": {"ativo": false, "janela": 100, "z": 1.64, "volta_media": 0.0}
+}
