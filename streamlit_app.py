@@ -42,9 +42,6 @@ from daytrade_smc import (
     Signal,
     SWING_CONFIRMATION_TIMEFRAMES,
     SWING_CONTEXT_TIMEFRAMES,
-    WINFUT_CONFIRMATION_TIMEFRAMES,
-    WINFUT_CONTEXT_TIMEFRAMES,
-    WINFUT_SYMBOL,
     analyze_symbol_mtf,
     check_signal_as_of,
     compute_market_bias,
@@ -479,51 +476,154 @@ OUTCOME_LABELS = {
 }
 
 
-def render_retro_check(symbol: str, style: str, modality: str, source: str, count: int) -> None:
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_ohlcv(symbol: str, timeframe: str, count: int, source: str) -> pd.DataFrame:
+    return daytrade_smc.fetch_ohlcv(symbol, timeframe, count, source=source)
+
+
+def retro_day(symbol: str, timeframe: str, day, modality: str, source: str, count: int,
+              score_min: float, use_window: bool) -> dict:
+    """
+    Repassa o pregão escolhido candle a candle, sem espiar o futuro: em cada
+    fechamento roda o motor só com o que existia até ali. O primeiro sinal
+    operável (direção definida, entrada calculada, score ≥ corte e — se o
+    filtro estiver ligado — dentro da janela de operação) é a entrada do dia
+    naquele ativo, como o robô faria (uma posição por ativo). Depois confere,
+    nos candles seguintes, se bateu alvo ou stop. O viés do IBOV não entra
+    aqui porque exigiria o IBOV histórico de cada instante.
+    """
+    duration = daytrade_smc.TIMEFRAMES[timeframe]["duration"]
+    hoje = pd.Timestamp.now(tz="America/Sao_Paulo").normalize()
+    dias_uteis = max(1, len(pd.bdate_range(pd.Timestamp(day), hoje.tz_localize(None))))
+    por_dia = {"M2": 240, "M5": 96, "M15": 32, "H1": 8, "H4": 2}.get(timeframe, 1)
+    fetch_count = min(count + por_dia * (dias_uteis + 1), 3000)
+    df = _cached_ohlcv(symbol, timeframe, fetch_count, source)
+
+    local = df.index.tz_convert("America/Sao_Paulo")
+    idx_dia = [i for i, t in enumerate(local) if t.date() == day]
+    base = {"Ativo": symbol, "Sinais no dia": 0}
+    if not idx_dia:
+        return {**base, "Resultado": "SEM_DADO", "Detalhe": "Sem candles deste ativo na data."}
+
+    sinais = 0
+    primeiro = None
+    for i in idx_dia:
+        if i < 30:
+            continue
+        fechamento = local[i] + duration
+        if use_window and not daytrade_smc.in_trading_window(fechamento):
+            continue
+        hist = df.iloc[max(0, i + 1 - count): i + 1]
+        _, signals = daytrade_smc.analyze(hist)
+        if modality == ALL_MODALITIES_OPTION:
+            direction = overall_direction(signals)
+            score = overall_score(signals)
+            conf = next(s for s in signals if s.name == "Confluência")
+            risk = conf.risk if conf.direction == direction else None
+            setup = conf.setup
+        else:
+            chosen = next(s for s in signals if s.name == modality)
+            direction, score, risk, setup = chosen.direction, chosen.score, chosen.risk, chosen.setup
+        if direction == Direction.NEUTRAL or risk is None or risk.entry is None or score < score_min:
+            continue
+        sinais += 1
+        if primeiro is None:
+            primeiro = (i, fechamento, direction, score, risk, setup)
+
+    if primeiro is None:
+        return {**base, "Resultado": "SEM_SINAL", "Detalhe": f"Nenhum sinal com score ≥ {score_min:.0f} no dia."}
+
+    i, fechamento, direction, score, risk, setup = primeiro
+    outcome, detail, _ = daytrade_smc.evaluate_signal_outcome(risk, direction, df.iloc[i + 1:])
+    return {**base, "Sinais no dia": sinais, "Hora": fechamento.strftime("%H:%M"), "Direção": direction.value,
+            "Score": round(score, 1), "Setup": setup, "Entrada": round(risk.entry, 2), "Stop": round(risk.stop, 2),
+            "Alvo 1": round(risk.target_1, 2) if risk.target_1 else None, "Resultado": outcome, "Detalhe": detail}
+
+
+def render_retro_all(style: str, modality: str, source: str, count: int) -> None:
     st.caption(
-        "Roda a análise usando SÓ os dados que existiam até a data escolhida (sem espiar o "
-        "futuro), depois confere o que aconteceu de verdade nos candles seguintes — se bateu "
-        "entrada, alvo ou stop."
+        "Repassa o pregão escolhido em todas as ações da watchlist, candle a candle, sem espiar o futuro. "
+        "Em cada ativo vale o primeiro sinal operável do dia, e depois confere se bateu alvo ou stop."
     )
-
     all_tfs = list(dict.fromkeys([*STYLES[style]["confirmation"], *STYLES[style]["context"]]))
-    col1, col2 = st.columns(2)
-    with col1:
-        check_tf = st.selectbox("Timeframe a verificar", all_tfs, format_func=lambda tf: TIMEFRAME_LABELS[tf])
-    with col2:
-        default_date = pd.Timestamp.now(tz="America/Sao_Paulo").date() - pd.Timedelta(days=1)
-        as_of_date = st.date_input("Data (fechamento até esse dia)", value=default_date)
+    all_tfs = [tf for tf in all_tfs if tf not in ("D1", "W1")] or all_tfs
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    with c1:
+        check_tf = st.selectbox("Timeframe", all_tfs, format_func=lambda tf: TIMEFRAME_LABELS[tf], key="retro_tf")
+    with c2:
+        default_date = (pd.Timestamp.now(tz="America/Sao_Paulo") - pd.tseries.offsets.BDay(1)).date()
+        day = st.date_input("Pregão", value=default_date, format="DD/MM/YYYY", key="retro_day")
+    with c3:
+        score_min = st.number_input("Score mínimo", min_value=0, max_value=100, value=70, step=5, key="retro_score")
+    with c4:
+        st.write("")
+        run = st.button("⏪ Verificar o dia", type="primary", use_container_width=True)
 
-    if st.button("🔍 Verificar", type="primary"):
-        as_of_ts = pd.Timestamp(as_of_date).tz_localize("America/Sao_Paulo") + pd.Timedelta(hours=23, minutes=59)
-        try:
-            check = check_signal_as_of(symbol, check_tf, as_of_ts, count=count, modality=modality, source=source)
-        except Exception as exc:
-            st.error(f"Não foi possível verificar: {exc}")
-            return
+    if run:
+        rows = []
+        symbols = st.session_state.watchlist
+        use_window = bool(st.session_state.get("filter_window", True))
+        prog = st.progress(0.0, text="Repassando o pregão...")
+        for n, symbol in enumerate(symbols):
+            prog.progress((n + 1) / len(symbols), text=f"Repassando {symbol} ({n + 1}/{len(symbols)})...")
+            try:
+                rows.append(retro_day(symbol, check_tf, day, modality, source, count, float(score_min), use_window))
+            except Exception as exc:
+                rows.append({"Ativo": symbol, "Resultado": "ERRO", "Detalhe": str(exc)[:80]})
+            if source != "MetaTrader 5":
+                time.sleep(0.3)
+        prog.empty()
+        st.session_state.retro_result = (pd.DataFrame(rows), day, check_tf, score_min)
 
-        st.markdown(f"**{symbol}** em **{TIMEFRAME_LABELS[check_tf]}** (leitura: **{modality}**), com dados até "
-                   f"**{check.as_of.strftime('%d/%m/%Y %H:%M')}**")
+    if "retro_result" not in st.session_state:
+        st.info("Escolha o pregão e clique em **⏪ Verificar o dia**.")
+        return
 
-        if check.direction == Direction.NEUTRAL or check.risk.entry is None:
-            st.info(f"Não havia sinal operável nesta data ({modality} estava NEUTRO).")
-            return
+    df, r_day, r_tf, r_score = st.session_state.retro_result
+    labels = {k: v[0] for k, v in OUTCOME_LABELS.items()} | {"SEM_DADO": "— Sem candles na data", "ERRO": "⚠️ Erro"}
+    com_sinal = df[df["Resultado"].isin(["ALVO_1", "ALVO_2", "STOP", "EM_ABERTO"])]
+    ganhos = int(com_sinal["Resultado"].isin(["ALVO_1", "ALVO_2"]).sum())
+    stops = int((com_sinal["Resultado"] == "STOP").sum())
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Ações verificadas", len(df))
+    k2.metric("Com sinal", len(com_sinal))
+    k3.metric("Bateram alvo", ganhos)
+    k4.metric("Bateram stop", stops)
+    k5.metric("Acerto", f"{ganhos / (ganhos + stops) * 100:.0f}%" if ganhos + stops else "—",
+              help="Alvos ÷ (alvos + stops). Operações em aberto não entram na conta.")
+    st.caption(f"Pregão {r_day.strftime('%d/%m/%Y')} · {TIMEFRAME_LABELS[r_tf]} · score ≥ {r_score} · "
+               f"filtro de janela {'ligado' if st.session_state.get('filter_window', True) else 'desligado'} · "
+               "sem o filtro do IBOV (precisaria do índice de cada instante).")
 
-        color = DIRECTION_COLOR[check.direction]
-        action = "COMPRAR" if check.direction == Direction.BUY else "VENDER"
-        if quality(check.score) == "OPORTUNIDADE EXCEPCIONAL":
-            st.markdown("🌟 **OPORTUNIDADE EXCEPCIONAL** nesta data")
-        st.markdown(
-            f'> **{action} {symbol}** perto de **R$ {check.risk.entry:.2f}**, stop em '
-            f'**R$ {check.risk.stop:.2f}**, alvo em **R$ {check.risk.target_1:.2f}** '
-            f'(setup: {check.setup}, score {check.score:.1f}/100)'
-        )
+    if com_sinal.empty:
+        st.info("Nenhuma ação teve sinal operável neste pregão com esse corte.")
+    else:
+        view = com_sinal.sort_values("Score", ascending=False).copy()
+        view["Resultado"] = view["Resultado"].map(labels)
+        cols = [c for c in ("Ativo", "Hora", "Direção", "Score", "Resultado", "Setup", "Entrada", "Stop", "Alvo 1",
+                            "Sinais no dia", "Detalhe") if c in view.columns]
 
-        outcome_label, outcome_color = OUTCOME_LABELS[check.outcome]
-        ui.banner(outcome_label, ui.esc(check.outcome_detail), outcome_color)
+        def _cor(val):
+            if isinstance(val, str) and val.startswith("✅"):
+                return f"color: {ui.BUY}; font-weight: 600"
+            if isinstance(val, str) and val.startswith("❌"):
+                return f"color: {ui.SELL}; font-weight: 600"
+            if val == "COMPRA":
+                return f"color: {ui.BUY}"
+            if val == "VENDA":
+                return f"color: {ui.SELL}"
+            return ""
 
-        if check.outcome in ("EM_ABERTO", "STOP", "ALVO_1", "ALVO_2"):
-            st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
+        st.dataframe(view[cols].style.map(_cor, subset=["Resultado", "Direção"]), hide_index=True,
+                     use_container_width=True, height=min(600, 45 + 35 * len(view)),
+                     column_config={"Score": SCORE_COL, **{c: st.column_config.NumberColumn(c, format="%.2f")
+                                                           for c in ("Entrada", "Stop", "Alvo 1")}})
+
+    sem = df[~df.index.isin(com_sinal.index)]
+    if len(sem):
+        with st.expander(f"{len(sem)} ações sem sinal ou sem dado nesta data"):
+            st.dataframe(sem.assign(Resultado=sem["Resultado"].map(labels))[["Ativo", "Resultado", "Detalhe"]],
+                         hide_index=True, use_container_width=True)
 
 
 def render_mtf_analysis(symbol: str, confirmation: tuple[str, str], context_tfs: tuple[str, ...], modality: str, source: str, count: int, risk_budget: float | None) -> None:
@@ -548,10 +648,6 @@ def render_mtf_analysis(symbol: str, confirmation: tuple[str, str], context_tfs:
 
 def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None) -> None:
     render_mtf_analysis(symbol, STYLES[style]["confirmation"], STYLES[style]["context"], modality, source, count, risk_budget)
-
-
-def render_winfut_analysis(modality: str, source: str, count: int, risk_budget: float | None) -> None:
-    render_mtf_analysis(WINFUT_SYMBOL, WINFUT_CONFIRMATION_TIMEFRAMES, WINFUT_CONTEXT_TIMEFRAMES, modality, source, count, risk_budget)
 
 
 def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_budget: float | None) -> None:
@@ -623,40 +719,6 @@ _AUTO_REFRESH_FRAGMENTS = {
     60: _auto_refresh_60,
     120: _auto_refresh_120,
     300: _auto_refresh_300,
-}
-
-
-@st.fragment(run_every=30)
-def _winfut_auto_refresh_30(modality, source, count, risk_budget):
-    render_winfut_analysis(modality, source, count, risk_budget)
-
-
-@st.fragment(run_every=60)
-def _winfut_auto_refresh_60(modality, source, count, risk_budget):
-    render_winfut_analysis(modality, source, count, risk_budget)
-
-
-@st.fragment(run_every=120)
-def _winfut_auto_refresh_120(modality, source, count, risk_budget):
-    render_winfut_analysis(modality, source, count, risk_budget)
-
-
-@st.fragment(run_every=300)
-def _winfut_auto_refresh_300(modality, source, count, risk_budget):
-    render_winfut_analysis(modality, source, count, risk_budget)
-
-
-@st.fragment(run_every=120)
-def _panorama_auto_120(render_fn):
-    cached_panorama_dados.clear()
-    render_fn()
-
-
-_WINFUT_AUTO_REFRESH_FRAGMENTS = {
-    30: _winfut_auto_refresh_30,
-    60: _winfut_auto_refresh_60,
-    120: _winfut_auto_refresh_120,
-    300: _winfut_auto_refresh_300,
 }
 
 
@@ -852,7 +914,7 @@ def run_opportunities(
 
 
 # ========================================================================
-# Estado inicial (ANTES da sidebar, pra widgets com `key` já nascerem
+# Estado inicial (ANTES dos widgets, pra widgets com `key` já nascerem
 # com o valor certo — evita o bug clássico do Streamlit de "mudei o
 # session_state depois que o widget já foi criado")
 # ========================================================================
@@ -888,209 +950,164 @@ def cached_panorama_dados():
 
 
 # ========================================================================
-# Navegação — os modos ficam numa barra horizontal no topo da página
+# Configurações — ficam dentro da aba Oportunidades, mas valem para todas.
+#
+# O Streamlit apaga o estado de um widget quando ele deixa de ser desenhado
+# (ao trocar de aba). Reatribuir cada chave no início de toda execução faz o
+# valor sobreviver mesmo com o painel fechado.
 # ========================================================================
-PANORAMA_MODE = "🌎 Panorama de mercado"
-MODES = ["🔥 Oportunidades agora", PANORAMA_MODE, "Análise individual", "Scanner (todos os ativos)",
-         "Verificação retroativa", "Mini Índice (WINFUT)"]
-_MODE_LABEL = {
-    "🔥 Oportunidades agora": "🔥 Oportunidades", PANORAMA_MODE: "🌎 Panorama", "Análise individual": "📈 Análise",
-    "Scanner (todos os ativos)": "🔍 Scanner", "Verificação retroativa": "⏪ Retroativa", "Mini Índice (WINFUT)": "📊 Mini índice",
+SETTINGS_DEFAULTS = {
+    "source_select": DATA_SOURCES[0],
+    "style_select": "Day Trade",
+    "modality_select": MODALITY_CHOICES[0],
+    "filter_window": True,
+    "filter_bias": True,
+    "count_select": 250,
+    "risk_select": 150.0,
+    "symbol_select": st.session_state.watchlist[0],
 }
-if st.session_state.get("mode_select") not in MODES:
-    st.session_state.mode_select = MODES[0]
-with st.container(key="topnav"):
-    mode = st.radio("Modo", MODES, key="mode_select", horizontal=True, label_visibility="collapsed",
-                    format_func=lambda m: _MODE_LABEL.get(m, m))
+for _k, _v in SETTINGS_DEFAULTS.items():
+    st.session_state[_k] = st.session_state.get(_k, _v)
 
-# ========================================================================
-# Sidebar
-# ========================================================================
-with st.sidebar:
-    ui.sidebar_brand()
+source = st.session_state.source_select
+style = st.session_state.style_select
+modality = st.session_state.modality_select
+count = int(st.session_state.count_select)
+risk_budget = float(st.session_state.risk_select) or None
+conf_a, conf_b = STYLES[style]["confirmation"]
+context_label = ", ".join(TIMEFRAME_LABELS[tf] for tf in STYLES[style]["context"])
 
-    st.markdown("### Fonte de dados")
-    source = st.radio(
-        "Fonte", DATA_SOURCES, key="source_select", horizontal=True,
-        help="Yahoo Finance funciona em qualquer lugar, com atraso de ~15-20min. MetaTrader 5 "
-             "direto é tempo real, mas só funciona rodando este app na máquina com o MT5 aberto. "
-             "\"GitHub (MT5 de casa)\" funciona de qualquer lugar (inclusive do trabalho) e busca "
-             "dado real do MT5, mas só atualiza quando você clicar em \"Atualizar via MT5\".",
-    )
-    if source == "MetaTrader 5":
-        st.caption(
-            "⚠️ Só funciona rodando localmente, na máquina com o MT5 aberto. Se você estiver "
-            "vendo isso no Streamlit Cloud, vai dar erro de conexão — o servidor da nuvem não "
-            "tem o MT5 instalado. Veja o README pra rodar local e acessar remoto."
-        )
-    elif source == "GitHub (MT5 de casa)":
-        last_update = fetch_snapshot_timestamp()
-        if last_update:
-            st.caption(f"📅 Última atualização: {pd.Timestamp(last_update).tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M:%S')}")
-        else:
-            st.caption("Nenhuma atualização publicada ainda — clique no botão abaixo.")
+window_ok, window_note = trading_window_status()
+st.session_state["_window_ok"] = window_ok
+bias = cached_market_bias(source)
+st.session_state["_bias_dir"] = bias.direction.value
+st.session_state["_bias_label"] = bias.label
 
-        if st.button("🔄 Atualizar via MT5 (casa)", use_container_width=True):
-            ok, msg = trigger_github_update()
-            if not ok:
-                st.error(msg)
-            else:
-                st.cache_data.clear()
-                with st.spinner("Aguardando seu computador em casa processar (isso leva alguns segundos)..."):
-                    trigger_time = pd.Timestamp.now(tz="UTC")
-                    updated = False
-                    for _ in range(30):  # até ~90s de espera (30 x 3s)
-                        time.sleep(3)
-                        ts = fetch_snapshot_timestamp()
-                        if ts and pd.Timestamp(ts) > trigger_time:
-                            updated = True
-                            break
-                if updated:
-                    st.cache_data.clear()
-                    st.success("Dados atualizados!")
-                    st.rerun()
+
+def render_settings() -> None:
+    """O antigo painel lateral, agora em colunas dentro da aba Oportunidades."""
+    with st.expander("⚙️ Configurações — valem para todas as abas", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("#### Leitura")
+            st.radio(
+                "Fonte de dados", DATA_SOURCES, key="source_select", horizontal=True,
+                help="Yahoo Finance funciona em qualquer lugar, com atraso de ~15-20min. MetaTrader 5 "
+                     "direto é tempo real, mas só funciona rodando este app na máquina com o MT5 aberto. "
+                     "\"GitHub (MT5 de casa)\" funciona de qualquer lugar e busca dado real do MT5, mas só "
+                     "atualiza quando você clicar em \"Atualizar via MT5\".",
+            )
+            if source == "MetaTrader 5":
+                st.caption("⚠️ Só funciona rodando localmente, na máquina com o MT5 aberto. No Streamlit Cloud "
+                           "dá erro de conexão.")
+            elif source == "GitHub (MT5 de casa)":
+                last_update = fetch_snapshot_timestamp()
+                if last_update:
+                    st.caption(f"📅 Última atualização: {pd.Timestamp(last_update).tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M:%S')}")
                 else:
-                    st.warning(
-                        "Não detectei a atualização em 90s. Confirme se o PC de casa está "
-                        "ligado, o MT5 aberto e logado, e o runner do GitHub Actions rodando. "
-                        "Pode levar mais tempo em alguns casos — tenta de novo em instantes."
-                    )
-
-    if mode == PANORAMA_MODE:
-        st.markdown("### Panorama")
-        st.caption("Placar do contexto externo (EUA, dólar, juros, commodities, bolsas globais) que pesa sobre o Ibovespa e o WINFUT. Dados do Yahoo Finance, cache de 2 min.")
-        if st.button("🔄 Atualizar cotações", type="primary", use_container_width=True):
-            cached_panorama_dados.clear()
-        auto_refresh = st.checkbox("Atualizar sozinho a cada 2 min", key="pn_auto")
-    else:
-        if mode != "Mini Índice (WINFUT)":
-            st.markdown("### Estilo de operação")
-            style = st.radio(
+                    st.caption("Nenhuma atualização publicada ainda. Clique no botão abaixo.")
+                if st.button("🔄 Atualizar via MT5 (casa)", use_container_width=True):
+                    ok, msg = trigger_github_update()
+                    if not ok:
+                        st.error(msg)
+                    else:
+                        st.cache_data.clear()
+                        with st.spinner("Aguardando o computador de casa processar..."):
+                            trigger_time = pd.Timestamp.now(tz="UTC")
+                            updated = False
+                            for _ in range(30):  # até ~90s de espera (30 x 3s)
+                                time.sleep(3)
+                                ts = fetch_snapshot_timestamp()
+                                if ts and pd.Timestamp(ts) > trigger_time:
+                                    updated = True
+                                    break
+                        if updated:
+                            st.cache_data.clear()
+                            st.success("Dados atualizados!")
+                            st.rerun()
+                        else:
+                            st.warning("Não detectei a atualização em 90s. Confirme se o PC de casa está ligado, "
+                                       "o MT5 aberto e logado, e o runner do GitHub Actions rodando.")
+            st.radio(
                 "Estilo", list(STYLES.keys()), key="style_select", horizontal=True,
-                help="Day Trade confirma em M15+H1 (posições no mesmo dia). "
-                     "Swing Trade confirma em Diário+Semanal (posições de dias a semanas), com H4 como contexto de timing de entrada.",
+                help="Day Trade confirma em M15+H1. Swing Trade confirma em Diário+Semanal, com H4 como contexto.",
             )
-            conf_a, conf_b = STYLES[style]["confirmation"]
-            context_label = ", ".join(TIMEFRAME_LABELS[tf] for tf in STYLES[style]["context"])
-            count_label = STYLES[style]["count_label"]
-        else:
-            style = None
-            conf_a, conf_b = WINFUT_CONFIRMATION_TIMEFRAMES
-            context_label = ", ".join(TIMEFRAME_LABELS[tf] for tf in WINFUT_CONTEXT_TIMEFRAMES)
-            count_label = "Candles fechados (M5 e M15)"
-            st.caption(
-                "📈 **Analisando exclusivamente o Mini Índice (WINFUT)** — contrato futuro, não faz "
-                "parte da watchlist de ações. Yahoo Finance normalmente não tem esse ativo disponível "
-                "de forma confiável; use MetaTrader 5 ou GitHub (MT5 de casa) como fonte."
+            st.selectbox(
+                "Modalidade (leitura base da recomendação)", MODALITY_CHOICES, key="modality_select",
+                help="Confluência combina SMC/Price Action/Médias/VWAP. IFR é uma leitura de exaustão independente. "
+                     "\"Todas as modalidades\" usa o score geral (média das 6 leituras).",
             )
-
-        st.markdown("### Modalidade")
-        modality = st.selectbox(
-            "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
-            help="Confluência combina as 4 categorias estruturais (SMC/Price Action/Médias/VWAP). "
-                 "IFR é uma leitura de exaustão independente, fora da Confluência. \"Todas as modalidades\" calcula um SCORE GERAL "
-                 "(média das 6 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
-                 "e ordenar o Scanner.",
-        )
-
-        if mode != "Mini Índice (WINFUT)":
-            st.markdown("### Ativos monitorados")
-            new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
-            if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
+        with c2:
+            st.markdown("#### Filtros e risco")
+            st.checkbox(
+                f"Só operar nas janelas {TRADING_WINDOWS_LABEL}", key="filter_window",
+                help="Fora dessas janelas os sinais são bloqueados (viram NEUTRO). Desmarque para estudar fora do "
+                     "horário ou para Swing Trade.",
+            )
+            st.caption(("🟢 " if window_ok else "🔴 ") + window_note)
+            st.checkbox("Bloquear operações contra o IBOV", key="filter_bias",
+                        help="IBOV caindo → não sugere COMPRA. IBOV subindo → não sugere VENDA.")
+            if bias.error:
+                st.caption(f"⚠️ Viés do índice indisponível ({bias.symbol}). Nenhum bloqueio aplicado.")
+            else:
+                icon = {"COMPRA": "📈", "VENDA": "📉", "NEUTRO": "➖"}[bias.direction.value]
+                st.caption(f"{icon} **{bias.label}** ({bias.change_pct:+.2f}% na sessão · força {bias.score:+.0f})")
+            st.slider(STYLES[style]["count_label"], min_value=50, max_value=400, step=10, key="count_select")
+            st.number_input("Risco máximo por operação (R$)", min_value=0.0, step=50.0, key="risk_select",
+                            help="Usado para calcular a quantidade de ações. Zero desliga o cálculo.")
+            st.caption(f"Recomendação exige {TIMEFRAME_LABELS[conf_a]} e {TIMEFRAME_LABELS[conf_b]} concordando; "
+                       f"{context_label} entra como contexto.")
+        with c3:
+            st.markdown(f"#### Ativos monitorados ({len(st.session_state.watchlist)})")
+            a1, a2 = st.columns([3, 1], vertical_alignment="bottom")
+            new_symbol = a1.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
+            if a2.button("Adicionar", use_container_width=True) and new_symbol.strip():
                 value = new_symbol.strip().upper().replace(" ", "")
                 if value not in st.session_state.watchlist:
                     st.session_state.watchlist.append(value)
                     _persist_watchlist()
                 st.rerun()
-
-            if mode in ("Análise individual", "Verificação retroativa"):
-                st.selectbox("Ativo para análise", st.session_state.watchlist, key="symbol_select")
-
-            remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
-            if st.button("Remover", use_container_width=True) and remove_symbol != "—":
+            r1, r2 = st.columns([3, 1], vertical_alignment="bottom")
+            remove_symbol = r1.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
+            if r2.button("Remover", use_container_width=True) and remove_symbol != "—":
                 st.session_state.watchlist = [s for s in st.session_state.watchlist if s != remove_symbol]
                 _persist_watchlist()
                 st.rerun()
+            b1, b2 = st.columns(2)
+            if b1.button("Lista padrão", use_container_width=True, help=f"Restaura os {len(DEFAULT_SYMBOLS)} ativos monitorados"):
+                st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
+                _persist_watchlist()
+                st.rerun()
+            if b2.button("Lista antiga", use_container_width=True, help="Restaura a watchlist anterior (VALE3, PETR4, ...)"):
+                st.session_state.watchlist = LEGACY_SYMBOLS.copy()
+                _persist_watchlist()
+                st.rerun()
+            st.caption(", ".join(st.session_state.watchlist))
 
-            col_a_btn, col_b_btn = st.columns(2)
-            with col_a_btn:
-                if st.button("Lista padrão", use_container_width=True,
-                             help=f"Restaura os {len(DEFAULT_SYMBOLS)} ativos monitorados"):
-                    st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
-                    _persist_watchlist()
-                    st.rerun()
-            with col_b_btn:
-                if st.button("Lista antiga", use_container_width=True,
-                             help="Restaura a watchlist anterior (VALE3, PETR4, ...)"):
-                    st.session_state.watchlist = LEGACY_SYMBOLS.copy()
-                    _persist_watchlist()
-                    st.rerun()
 
-        # ------------------------------------------------------------------
-        # Filtros operacionais (pontos 1 e 2)
-        # ------------------------------------------------------------------
-        st.markdown("### Filtros operacionais")
-        intraday_mode = (mode == "Mini Índice (WINFUT)") or style == "Day Trade"
+# ========================================================================
+# Topo fixo: faixa do panorama (texto) + navegação horizontal
+# ========================================================================
+@st.fragment(run_every=120)
+def _faixa_panorama():
+    try:
+        diario, intra = cached_panorama_dados()
+        st.markdown(panorama_ui.faixa(panorama.montar(diario, intra)), unsafe_allow_html=True)
+    except Exception:
+        st.markdown(panorama_ui.faixa(None), unsafe_allow_html=True)
 
-        st.checkbox(
-            f"Só operar nas janelas {TRADING_WINDOWS_LABEL}",
-            value=intraday_mode, key="filter_window",
-            help="Fora dessas duas janelas os sinais são bloqueados (viram NEUTRO). "
-                 "São os horários de maior volatilidade e assertividade do pregão. "
-                 "Desmarque para estudar fora do horário ou para Swing Trade.",
-        )
-        window_ok, window_note = trading_window_status()
-        st.session_state["_window_ok"] = window_ok
-        st.caption(("🟢 " if window_ok else "🔴 ") + window_note)
 
-        st.checkbox(
-            "Bloquear operações contra o IBOV", value=True, key="filter_bias",
-            help="IBOV caindo → não sugere COMPRA. IBOV subindo → não sugere VENDA.",
-        )
-        bias = cached_market_bias(source)
-        st.session_state["_bias_dir"] = bias.direction.value
-        st.session_state["_bias_label"] = bias.label
-        if bias.error:
-            st.caption(f"⚠️ Viés do índice indisponível ({bias.symbol}) — nenhum bloqueio aplicado.")
-        else:
-            icon = {"COMPRA": "📈", "VENDA": "📉", "NEUTRO": "➖"}[bias.direction.value]
-            st.caption(f"{icon} **{bias.label}** ({bias.change_pct:+.2f}% na sessão · força {bias.score:+.0f})")
-
-        st.markdown("### Parâmetros")
-        st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "
-                  f"(ver \"Filtro multi-timeframe\" no rodapé). "
-                  f"{context_label} aparece como contexto adicional.")
-        count = st.slider(count_label, min_value=50, max_value=400, value=250, step=10)
-        risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
-        risk_budget = risk_budget if risk_budget > 0 else None
-
-        if mode in ("Análise individual", "Mini Índice (WINFUT)"):
-            st.markdown("### Atualização")
-            auto_refresh = st.checkbox("Atualizar automaticamente")
-            refresh_interval = st.select_slider(
-                "Intervalo", options=[30, 60, 120, 300], value=60, format_func=lambda s: f"{s}s",
-                disabled=not auto_refresh,
-            )
-        elif mode == "Scanner (todos os ativos)":
-            run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
-        elif mode == "🔥 Oportunidades agora":
-            st.markdown("### Critério de oportunidade")
-            opp_threshold = st.slider(
-                "Score mínimo", min_value=60, max_value=95, value=75, step=5,
-                help="Mostra qualquer leitura (Confluência, SMC, Price Action, Médias, VWAP ou IFR) "
-                     "com score acima deste corte.",
-            )
-            st.caption(
-                "⚠️ As leituras isoladas (SMC, Price Action, Médias, VWAP, IFR) são limitadas a "
-                "**79 pontos** pelo próprio motor — só a Confluência passa disso. Com corte acima "
-                "de 79 a lista mostra **apenas Confluência**."
-            )
-            opp_require_conf = st.checkbox(
-                "Exigir a mesma direção nos dois timeframes", value=True,
-                help=f"A leitura precisa apontar a mesma direção em {conf_a} e {conf_b}. "
-                     "Desmarcar aumenta MUITO o número de resultados — e o de falsos positivos.",
-            )
-            run_opp_clicked = st.button("🔥 Buscar oportunidades", type="primary", use_container_width=True)
+MODES = ["🔥 Oportunidades agora", "Análise individual", "Scanner (todos os ativos)", "Verificação retroativa"]
+_MODE_LABEL = {
+    "🔥 Oportunidades agora": "🔥 Oportunidades", "Análise individual": "📈 Análise",
+    "Scanner (todos os ativos)": "🔍 Scanner", "Verificação retroativa": "⏪ Retroativa",
+}
+if st.session_state.get("mode_select") not in MODES:
+    st.session_state.mode_select = MODES[0]
+with st.container(key="topnav"):
+    _faixa_panorama()
+    mode = st.radio("Modo", MODES, key="mode_select", horizontal=True, label_visibility="collapsed",
+                    format_func=lambda m: _MODE_LABEL.get(m, m))
 
 
 # ========================================================================
@@ -1098,52 +1115,58 @@ with st.sidebar:
 # ========================================================================
 _MODE_SUB = {
     "🔥 Oportunidades agora": "Só o que está operável agora, em toda a watchlist",
-    PANORAMA_MODE: "Contexto externo que pesa sobre o Ibovespa e o mini índice",
-    "Análise individual": f"{st.session_state.get('symbol_select', '')} · gráfico e as 6 leituras",
-    "Scanner (todos os ativos)": "Ranking da watchlist pelo score de confluência",
-    "Verificação retroativa": f"{st.session_state.get('symbol_select', '')} · o sinal de um dia passado e o que aconteceu depois",
-    "Mini Índice (WINFUT)": "Mini índice em M5 e M15",
+    "Análise individual": "Gráfico e as 6 leituras de um ativo",
+    "Scanner (todos os ativos)": "Ranking da watchlist pelo score geral (só score 30 ou mais)",
+    "Verificação retroativa": "Um pregão passado, em todas as ações, e o que aconteceu depois",
 }
-_win_ok_hero, _win_note_hero = trading_window_status()
-_bias_hero = cached_market_bias(source)
-if _bias_hero.error:
+if bias.error:
     _bias_chip = ("IBOV indisponível", ui.MUTED)
 else:
-    _bias_chip = (f"IBOV {_bias_hero.change_pct:+.2f}% · {_bias_hero.direction.value.lower()}",
-                  ui.tone_for(_bias_hero.direction.value))
+    _bias_chip = (f"IBOV {bias.change_pct:+.2f}% · {bias.direction.value.lower()}", ui.tone_for(bias.direction.value))
 ui.hero(
     "Day Trade SMC",
     _MODE_SUB.get(mode, ""),
     [
-        ("Janela aberta" if _win_ok_hero else "Fora da janela", ui.BUY if _win_ok_hero else ui.SELL),
+        ("Janela aberta" if window_ok else "Fora da janela", ui.BUY if window_ok else ui.SELL),
         _bias_chip,
         ({"Yahoo Finance": "Yahoo · atraso", "MetaTrader 5": "MT5 · tempo real"}.get(source, "MT5 de casa"),
          ui.GOLD if source == "Yahoo Finance" else ui.STEEL),
+        (f"Risco R$ {risk_budget:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if risk_budget else "Sem risco definido", ui.STEEL),
     ],
     delay_note=source == "Yahoo Finance",
 )
 
 if mode == "🔥 Oportunidades agora":
-    window_ok_now, window_note_now = _win_ok_hero, _win_note_hero
-    bias_now = _bias_hero
+    render_settings()
 
-    if bias_now.error:
+    if bias.error:
         _lado = "Viés do IBOV indisponível: nenhum bloqueio direcional."
-    elif bias_now.direction == Direction.BUY:
-        _lado = f"{bias_now.label}: só compra liberada."
-    elif bias_now.direction == Direction.SELL:
-        _lado = f"{bias_now.label}: só venda liberada."
+    elif bias.direction == Direction.BUY:
+        _lado = f"{bias.label}: só compra liberada."
+    elif bias.direction == Direction.SELL:
+        _lado = f"{bias.label}: só venda liberada."
     else:
-        _lado = f"{bias_now.label}: os dois lados liberados."
-    ui.banner(f"⏰ {ui.esc(window_note_now)}", ui.esc(_lado), ui.BUY if window_ok_now else ui.SELL)
+        _lado = f"{bias.label}: os dois lados liberados."
 
-    if st.session_state.get("filter_window", True) and not window_ok_now:
-        st.warning(
-            f"Fora da janela de operação ({TRADING_WINDOWS_LABEL}), todos os sinais são "
-            "bloqueados — a lista virá vazia. Desmarque o filtro na barra lateral se quiser "
-            "estudar o mercado assim mesmo."
+    o1, o2, o3 = st.columns([2, 2, 1.2], vertical_alignment="bottom")
+    with o1:
+        opp_threshold = st.slider(
+            "Score mínimo", min_value=60, max_value=95, value=75, step=5, key="opp_threshold",
+            help="Leituras isoladas (SMC, Price Action, Médias, VWAP, IFR) vão no máximo a 79 pontos; "
+                 "acima de 79 só aparece Confluência.",
         )
+    with o2:
+        opp_require_conf = st.checkbox(
+            f"Exigir a mesma direção em {conf_a} e {conf_b}", value=True, key="opp_require_conf",
+            help="Desmarcar aumenta muito o número de resultados, e o de falsos positivos.",
+        )
+    with o3:
+        run_opp_clicked = st.button("🔥 Buscar oportunidades", type="primary", use_container_width=True)
 
+    ui.banner(f"⏰ {ui.esc(window_note)}", ui.esc(_lado), ui.BUY if window_ok else ui.SELL)
+    if st.session_state.get("filter_window", True) and not window_ok:
+        st.warning(f"Fora da janela de operação ({TRADING_WINDOWS_LABEL}) todos os sinais são bloqueados e a "
+                   "lista virá vazia. Desmarque o filtro em ⚙️ Configurações para estudar o mercado assim mesmo.")
     st.caption(f"{len(st.session_state.watchlist)} ativos · {style} · confirmação {conf_a}+{conf_b} · "
                f"{count} candles · fonte: {source}")
 
@@ -1163,8 +1186,8 @@ if mode == "🔥 Oportunidades agora":
             st.info(
                 f"Nenhuma oportunidade acima de {thr} pontos no momento"
                 + (" (exigindo os dois timeframes na mesma direção)." if req_conf else ".")
-                + " Isso é informação, não falha: na maior parte do tempo o mercado não oferece "
-                "setup de alta qualidade. Rode de novo mais tarde ou baixe o corte."
+                + " Na maior parte do tempo o mercado não oferece setup de alta qualidade. "
+                "Rode de novo mais tarde ou baixe o corte."
             )
         else:
             ativos = opp_df["Ativo"].nunique()
@@ -1194,37 +1217,26 @@ if mode == "🔥 Oportunidades agora":
                 column_config=_score_cols(opp_df),
             )
 
-            if not st.session_state.get("opp_risk_budget"):
-                st.caption("Defina o **Risco máximo (R$)** na barra lateral pra ver a quantidade sugerida.")
-
-            st.markdown("#### Abrir análise completa")
-            pick = st.selectbox("Ativo", opp_df["Ativo"].unique().tolist(), key="opp_pick_select")
-            if st.button("Ver gráfico e as 6 leituras"):
+            p1, p2 = st.columns([3, 1], vertical_alignment="bottom")
+            pick = p1.selectbox("Abrir análise completa de", opp_df["Ativo"].unique().tolist(), key="opp_pick_select")
+            if p2.button("Ver gráfico e as 6 leituras", use_container_width=True):
                 if pick not in st.session_state.watchlist:
                     st.session_state.watchlist.append(pick)
                 st.session_state.jump_to_symbol = pick
                 st.rerun()
     else:
-        st.info("Clique em **🔥 Buscar oportunidades** na barra lateral. "
+        st.info("Clique em **🔥 Buscar oportunidades**. "
                 f"A varredura leva ~{max(1, len(st.session_state.watchlist) * 2 // 60)}-"
                 f"{max(2, len(st.session_state.watchlist) * 4 // 60)} min com {len(st.session_state.watchlist)} ativos no Yahoo Finance.")
 
-elif mode == PANORAMA_MODE:
-    def _render_panorama():
-        try:
-            diario, intra = cached_panorama_dados()
-        except Exception as exc:
-            st.error(f"Não foi possível buscar as cotações no Yahoo: {exc}. Tente de novo em alguns minutos.")
-            return
-        panorama_ui.render(panorama.montar(diario, intra))
-
-    if auto_refresh:
-        _panorama_auto_120(_render_panorama)
-    else:
-        with st.spinner("Buscando cotações..."):
-            _render_panorama()
-
 elif mode == "Análise individual":
+    if st.session_state.get("symbol_select") not in st.session_state.watchlist:
+        st.session_state.symbol_select = st.session_state.watchlist[0]
+    a1, a2, a3 = st.columns([2, 1, 1], vertical_alignment="bottom")
+    a1.selectbox("Ativo", st.session_state.watchlist, key="symbol_select")
+    auto_refresh = a2.checkbox("Atualizar sozinho", key="ind_auto")
+    refresh_interval = a3.select_slider("Intervalo", options=[30, 60, 120, 300], value=60, key="ind_interval",
+                                        format_func=lambda s: f"{s}s", disabled=not auto_refresh)
     symbol = st.session_state.symbol_select
 
     if auto_refresh:
@@ -1234,19 +1246,22 @@ elif mode == "Análise individual":
         render_individual_analysis(symbol, style, modality, source, count, risk_budget)
 
 elif mode == "Scanner (todos os ativos)":
-    st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
-              f"{count} candles · recomendação exige {conf_a}+{conf_b} concordando")
+    SCORE_MIN_SCANNER = 30.0
+    s1, s2 = st.columns([3, 1], vertical_alignment="bottom")
+    s1.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
+               f"{count} candles · recomendação exige {conf_a}+{conf_b} concordando · "
+               f"só aparecem ações com score geral ≥ {SCORE_MIN_SCANNER:.0f}")
+    run_scanner_clicked = s2.button("🔍 Rodar scanner", type="primary", use_container_width=True)
 
     if run_scanner_clicked:
         st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget)
         st.session_state.scanner_risk_budget = risk_budget
 
     if "scanner_result" in st.session_state:
-        result_df = st.session_state.scanner_result
-
-        if not st.session_state.get("scanner_risk_budget"):
-            st.info("Defina o **Risco máximo (R$)** na barra lateral e rode o scanner de novo pra ver a "
-                    "quantidade sugerida de ações em cada ativo.")
+        full_df = st.session_state.scanner_result
+        result_df = full_df[pd.to_numeric(full_df["Score Geral"], errors="coerce") >= SCORE_MIN_SCANNER].copy()
+        result_df["Posição"] = range(1, len(result_df) + 1)
+        ocultos = len(full_df) - len(result_df)
 
         def _color_direction(val):
             if val == "COMPRA":
@@ -1255,36 +1270,33 @@ elif mode == "Scanner (todos os ativos)":
                 return f"color: {ui.SELL}; font-weight: 600"
             return f"color: {ui.MUTED}"
 
-        _conf = result_df[result_df["Confirmado"] == "✅"] if "Confirmado" in result_df.columns else result_df.iloc[0:0]
+        _conf = result_df[result_df["Confirmado"] == "✅"]
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Ativos analisados", len(result_df))
+        k1.metric("Ações com score ≥ 30", len(result_df),
+                  help=f"{ocultos} ação(ões) ficaram de fora por score abaixo de 30 ou falta de dados.")
         k2.metric("Confirmados", len(_conf))
-        k3.metric("Compras", int((_conf["Direção"] == "COMPRA").sum()) if len(_conf) else 0)
-        k4.metric("Vendas", int((_conf["Direção"] == "VENDA").sum()) if len(_conf) else 0)
-        if "Score Geral" in result_df.columns:
-            ui.podium(_podium_rows(_conf, "Score Geral", ("Destaque", "Fluxo")))
+        k3.metric("Compras", int((_conf["Direção"] == "COMPRA").sum()))
+        k4.metric("Vendas", int((_conf["Direção"] == "VENDA").sum()))
+        ui.podium(_podium_rows(_conf, "Score Geral", ("Destaque", "Fluxo")))
 
-        st.dataframe(
-            result_df.style.map(_color_direction, subset=["Direção"]),
-            hide_index=True, use_container_width=True, height=min(450, 45 + 35 * len(result_df)),
-            column_config=_score_cols(result_df),
-        )
-
-        st.markdown("#### Abrir análise completa de um ativo")
-        pick = st.selectbox("Ativo", result_df["Ativo"].tolist(), key="scanner_pick_select")
-        if st.button("Ver gráfico e as 6 leituras completas"):
-            st.session_state.jump_to_symbol = pick
-            st.rerun()
+        if result_df.empty:
+            st.info(f"Nenhuma ação com score geral ≥ {SCORE_MIN_SCANNER:.0f} nesta varredura.")
+        else:
+            st.dataframe(
+                result_df.style.map(_color_direction, subset=["Direção"]),
+                hide_index=True, use_container_width=True, height=min(600, 45 + 35 * len(result_df)),
+                column_config=_score_cols(result_df),
+            )
+            p1, p2 = st.columns([3, 1], vertical_alignment="bottom")
+            pick = p1.selectbox("Abrir análise completa de", result_df["Ativo"].tolist(), key="scanner_pick_select")
+            if p2.button("Ver gráfico e as 6 leituras", use_container_width=True):
+                st.session_state.jump_to_symbol = pick
+                st.rerun()
+        erros = full_df[full_df["Confirmado"] == "ERRO"]
+        if len(erros):
+            st.caption(f"⚠️ {len(erros)} ativo(s) sem dados nesta varredura: {', '.join(erros['Ativo'])}")
     else:
-        st.info("Clique em **Rodar scanner** na barra lateral para analisar todos os ativos da watchlist.")
+        st.info("Clique em **🔍 Rodar scanner** para analisar todos os ativos da watchlist.")
 
-elif mode == "Verificação retroativa":
-    symbol = st.session_state.symbol_select
-    render_retro_check(symbol, style, modality, source, count)
-
-else:  # Mini Índice (WINFUT)
-    if auto_refresh:
-        st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _WINFUT_AUTO_REFRESH_FRAGMENTS[refresh_interval](modality, source, count, risk_budget)
-    else:
-        render_winfut_analysis(modality, source, count, risk_budget)
+else:  # Verificação retroativa
+    render_retro_all(style, modality, source, count)

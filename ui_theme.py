@@ -51,7 +51,7 @@ html, body, .stApp, [data-testid="stAppViewContainer"] {{
   font-family: '{FONT_BODY}', system-ui, sans-serif;
   font-variant-numeric: tabular-nums;
 }}
-[data-testid="stHeader"] {{ background: transparent; }}
+[data-testid="stHeader"] {{ background: var(--ink); }}
 .block-container {{ padding-top: 1.6rem; max-width: 1480px; }}
 h1, h2, h3, h4 {{ font-family: '{FONT_HEAD}', sans-serif !important; letter-spacing: -.01em; color: var(--text); }}
 h3 {{ font-size: 1.15rem !important; font-weight: 700 !important; margin-top: .6rem; }}
@@ -91,7 +91,12 @@ p, li, label, .stMarkdown {{ font-family: '{FONT_BODY}', sans-serif; }}
 [data-testid="stSidebar"] [role="radiogroup"] label[data-selected="true"] p,
 [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) p {{ color: var(--text); font-weight: 700; }}
 /* barra de navegação horizontal no topo (os modos) */
-.st-key-topnav {{ position: sticky; top: 0; z-index: 50; padding: 4px 0 10px; background: linear-gradient(180deg, var(--ink) 70%, transparent); }}
+/* o bloco do topo (faixa + navegação) fica preso abaixo do cabeçalho do Streamlit */
+[data-testid="stLayoutWrapper"]:has(> .st-key-topnav),
+[data-testid="stVerticalBlockBorderWrapper"]:has(> div > .st-key-topnav) {{
+  position: sticky; top: 2.9rem; z-index: 50; background: var(--ink); box-shadow: 0 10px 14px -6px rgba(0,0,0,.6);
+}}
+.st-key-topnav {{ padding: 4px 0 8px; }}
 .st-key-topnav [role="radiogroup"] {{
   display:flex; flex-wrap: wrap; gap: 6px !important; padding: 6px; border-radius: 16px; width: fit-content; max-width: 100%;
   background: rgba(0,0,0,.25); box-shadow: 0 2px 6px rgba(0,0,0,.45) inset;
