@@ -547,14 +547,26 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
     )
     all_tfs = list(dict.fromkeys([*STYLES[style]["confirmation"], *STYLES[style]["context"]]))
     all_tfs = [tf for tf in all_tfs if tf not in ("D1", "W1")] or all_tfs
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    c0, c1, c2, c3, c4 = st.columns([1.3, 1, 1, 0.8, 1])
+    with c0:
+        # A Retroativa tem leitura própria, com o padrão do robô (Confluência ≥ 80).
+        # O score geral de "Todas as modalidades" é a MÉDIA das 6 leituras e quase
+        # nunca passa de 70 (máximo de 72 em 4 pregões reais de novembro), por
+        # isso não serve como corte de entrada.
+        retro_mod = st.selectbox("Leitura", MODALITY_CHOICES, index=MODALITY_CHOICES.index("Confluência"),
+                                 key="retro_mod",
+                                 help="Padrão: Confluência, a mesma leitura que o robô usa no corte de 80. "
+                                      "\"Todas as modalidades\" usa o score geral (média das 6 leituras), "
+                                      "que quase nunca passa de 70.")
     with c1:
         check_tf = st.selectbox("Timeframe", all_tfs, format_func=lambda tf: TIMEFRAME_LABELS[tf], key="retro_tf")
     with c2:
         default_date = (pd.Timestamp.now(tz="America/Sao_Paulo") - pd.tseries.offsets.BDay(1)).date()
         day = st.date_input("Pregão", value=default_date, format="DD/MM/YYYY", key="retro_day")
     with c3:
-        score_min = st.number_input("Score mínimo", min_value=0, max_value=100, value=70, step=5, key="retro_score")
+        score_min = st.number_input("Score mínimo", min_value=0, max_value=100, value=80, step=5, key="retro_score",
+                                    help="Padrão 80, o corte do robô. As leituras isoladas (SMC, Price Action, "
+                                         "Médias, VWAP) vão no máximo a 79.")
     with c4:
         st.write("")
         run = st.button("⏪ Verificar o dia", type="primary", use_container_width=True)
@@ -567,19 +579,21 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
         for n, symbol in enumerate(symbols):
             prog.progress((n + 1) / len(symbols), text=f"Repassando {symbol} ({n + 1}/{len(symbols)})...")
             try:
-                rows.append(retro_day(symbol, check_tf, day, modality, source, count, float(score_min), use_window))
+                rows.append(retro_day(symbol, check_tf, day, retro_mod, source, count, float(score_min), use_window))
             except Exception as exc:
                 rows.append({"Ativo": symbol, "Resultado": "ERRO", "Detalhe": str(exc)[:80]})
             if source != "MetaTrader 5":
                 time.sleep(0.3)
         prog.empty()
-        st.session_state.retro_result = (pd.DataFrame(rows), day, check_tf, score_min)
+        st.session_state.retro_result = (pd.DataFrame(rows), day, check_tf, score_min, retro_mod)
 
+    if len(st.session_state.get("retro_result", ())) != 5:  # resultado salvo por uma versão anterior
+        st.session_state.pop("retro_result", None)
     if "retro_result" not in st.session_state:
         st.info("Escolha o pregão e clique em **⏪ Verificar o dia**.")
         return
 
-    df, r_day, r_tf, r_score = st.session_state.retro_result
+    df, r_day, r_tf, r_score, r_mod = st.session_state.retro_result
     labels = {k: v[0] for k, v in OUTCOME_LABELS.items()} | {"SEM_DADO": "— Sem candles na data", "ERRO": "⚠️ Erro"}
     com_sinal = df[df["Resultado"].isin(["ALVO_1", "ALVO_2", "STOP", "EM_ABERTO"])]
     ganhos = int(com_sinal["Resultado"].isin(["ALVO_1", "ALVO_2"]).sum())
@@ -591,7 +605,7 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
     k4.metric("Bateram stop", stops)
     k5.metric("Acerto", f"{ganhos / (ganhos + stops) * 100:.0f}%" if ganhos + stops else "—",
               help="Alvos ÷ (alvos + stops). Operações em aberto não entram na conta.")
-    st.caption(f"Pregão {r_day.strftime('%d/%m/%Y')} · {TIMEFRAME_LABELS[r_tf]} · score ≥ {r_score} · "
+    st.caption(f"Pregão {r_day.strftime('%d/%m/%Y')} · {TIMEFRAME_LABELS[r_tf]} · {r_mod} · score ≥ {r_score} · "
                f"filtro de janela {'ligado' if st.session_state.get('filter_window', True) else 'desligado'} · "
                "sem o filtro do IBOV (precisaria do índice de cada instante).")
 
