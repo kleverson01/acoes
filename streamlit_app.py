@@ -26,6 +26,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import daytrade_smc
+import ui_theme as ui
 from daytrade_smc import (
     ALL_MODALITIES_OPTION,
     DATA_SOURCES,
@@ -82,11 +83,12 @@ STYLES = {
 }
 
 st.set_page_config(page_title="Day Trade SMC", page_icon="📊", layout="wide")
+ui.inject()
 
 DIRECTION_COLOR = {
-    Direction.BUY: "#2ed3a3",
-    Direction.SELL: "#ff5470",
-    Direction.NEUTRAL: "#8291a1",
+    Direction.BUY: ui.BUY,
+    Direction.SELL: ui.SELL,
+    Direction.NEUTRAL: ui.MUTED,
 }
 
 
@@ -244,7 +246,7 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
             x=[x[e.index] for e in pts],
             y=[df["high"].iloc[e.index] * 1.003 if e.direction == Direction.BUY else df["low"].iloc[e.index] * 0.997 for e in pts],
             mode="markers+text", name=kind,
-            marker=dict(symbol=symb, size=11, color=color, line=dict(width=1, color="#0a0e13")),
+            marker=dict(symbol=symb, size=11, color=color, line=dict(width=1, color=ui.INK)),
             text=[kind] * len(pts), textposition="top center", textfont=dict(size=9, color=color),
         ))
 
@@ -270,17 +272,19 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
             if price is None:
                 continue
             fig.add_hline(y=price, line=dict(color=color, width=1.4, dash="solid" if label != "Alvo 2" else "dash"),
-                          annotation_text=f"{label}: {price:.2f}", annotation_position="right",
+                          annotation_text=f"{label}: {price:.2f}", annotation_position="top left",
                           annotation=dict(font=dict(size=10, color=color)))
 
     fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0a0e13", plot_bgcolor="#0a0e13",
-        height=560, margin=dict(l=10, r=10, t=30, b=10),
+        height=560, margin=dict(l=10, r=56, t=34, b=10),
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
-        font=dict(family="IBM Plex Mono, monospace", size=11, color="#8291a1"),
     )
+    ui.style_figure(fig)
+    # some com as lacunas de fim de semana e da madrugada — o gráfico fica contínuo
+    breaks = [dict(bounds=["sat", "mon"])]
+    if len(x) > 2 and (x[1:] - x[:-1]).median() < pd.Timedelta(hours=6):
+        breaks.append(dict(bounds=[18.5, 9.9], pattern="hour"))  # madrugada (horário de Brasília)
+    fig.update_xaxes(rangebreaks=breaks)
     return fig
 
 
@@ -291,32 +295,18 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) 
     color = DIRECTION_COLOR[signal.direction]
     q = quality(signal.score)
 
-    if q == "OPORTUNIDADE EXCEPCIONAL" and signal.direction != Direction.NEUTRAL:
-        action = "COMPRA" if signal.direction == Direction.BUY else "VENDA"
-        st.markdown(
-            f'<div style="border:2px solid #f0b429; border-radius:8px; padding:10px 16px; '
-            f'background:#f0b42922; margin-bottom:12px; text-align:center;">'
-            f'<span style="font-size:18px;">🌟 <b style="color:#f0b429;">OPORTUNIDADE EXCEPCIONAL</b> · '
-            f'{action} · score {signal.score:.1f}/100</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    c1, c2, c3 = st.columns([2, 1, 1])
-    c1.markdown(f"### {signal.setup}")
-    c2.metric("Direção", signal.direction.value)
-    c3.metric("Score", f"{signal.score:.1f}/100", q)
-
     risk = signal.risk
-    if signal.direction == Direction.NEUTRAL or risk.entry is None:
-        st.info("Sem sinal operável nesta leitura — entrada, stop e alvos foram bloqueados.")
+    operavel = signal.direction != Direction.NEUTRAL and risk.entry is not None
+    exceptional = q == "OPORTUNIDADE EXCEPCIONAL" and signal.direction != Direction.NEUTRAL
+    if operavel:
+        action = "Comprar" if signal.direction == Direction.BUY else "Vender"
+        line = (f"{action} <b>{ui.esc(symbol)}</b> perto de <b>R$ {risk.entry:.2f}</b>, stop em "
+                f"<b>R$ {risk.stop:.2f}</b>, alvo em <b>R$ {risk.target_1:.2f}</b> (R/R 1:{risk.rr:.2f})")
     else:
-        action = "COMPRAR" if signal.direction == Direction.BUY else "VENDER"
-        st.markdown(
-            f"> **{action} {symbol}** perto de **R$ {risk.entry:.2f}**, stop em "
-            f"**R$ {risk.stop:.2f}**, alvo em **R$ {risk.target_1:.2f}** (R/R 1:{risk.rr:.2f})."
-        )
+        line = "Sem sinal operável nesta leitura. Entrada, stop e alvos ficam bloqueados."
+    ui.ticket(signal.direction.value, signal.setup, line, signal.score, q, exceptional)
 
+    if operavel:
         cols = st.columns(4)
         cols[0].metric("Entrada", f"R$ {risk.entry:.2f}")
         cols[1].metric("Stop", f"R$ {risk.stop:.2f}", f"{(risk.stop-risk.entry)/risk.entry*100:+.2f}%")
@@ -347,6 +337,28 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) 
             st.warning(alert)
 
 
+SCORE_COL = st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f")
+
+
+def _score_cols(df: pd.DataFrame) -> dict:
+    """Colunas de score viram barras de 0 a 100 — leitura imediata do ranking."""
+    return {c: st.column_config.ProgressColumn(c, min_value=0, max_value=100, format="%.1f")
+            for c in df.columns if str(c).startswith("Score")}
+
+
+def _podium_rows(df: pd.DataFrame, score_col: str, meta_cols: tuple[str, ...]) -> list[dict]:
+    rows = []
+    for _, r in df.head(3).iterrows():
+        if r.get("Direção") not in ("COMPRA", "VENDA") or pd.isna(r.get(score_col)):
+            continue
+        rows.append({
+            "ativo": r["Ativo"], "direcao": r["Direção"], "score": float(r[score_col]),
+            "meta": " · ".join(str(r[c]) for c in meta_cols if c in r and str(r[c]) not in ("", "nan", "None")),
+            "entrada": r.get("Entrada"), "stop": r.get("Stop"), "alvo": r.get("Alvo 1"),
+        })
+    return rows
+
+
 TIMEFRAME_LABELS = {
     "M2": "2 minutos",
     "M5": "5 minutos",
@@ -364,22 +376,22 @@ def render_filter_badges(mtf) -> None:
 
     with col1:
         if not st.session_state.get("filter_window", True):
-            st.caption(f"⏰ Filtro de janela DESLIGADO ({TRADING_WINDOWS_LABEL})")
+            ui.banner("⏰ Filtro de janela desligado", ui.esc(TRADING_WINDOWS_LABEL), ui.MUTED)
         elif mtf.window_ok:
-            st.success(f"⏰ {mtf.window_note}", icon="✅")
+            ui.banner(f"⏰ {ui.esc(mtf.window_note)}", "Sinais liberados.", ui.BUY)
         else:
-            st.error(f"⏰ {mtf.window_note} Sinais bloqueados.", icon="⛔")
+            ui.banner(f"⏰ {ui.esc(mtf.window_note)}", "Sinais bloqueados.", ui.SELL)
 
     with col2:
-        label = mtf.bias_label or "IBOV não medido"
+        label = ui.esc(mtf.bias_label or "IBOV não medido")
         if not st.session_state.get("filter_bias", True):
-            st.caption("📉 Filtro de viés do IBOV DESLIGADO")
+            ui.banner("📉 Filtro de viés do IBOV desligado", "", ui.MUTED)
         elif mtf.bias_direction == Direction.BUY:
-            st.success(f"📈 {label} — só COMPRA liberada (vendas bloqueadas)", icon="📈")
+            ui.banner(f"📈 {label}", "Só compra liberada, vendas bloqueadas.", ui.BUY)
         elif mtf.bias_direction == Direction.SELL:
-            st.error(f"📉 {label} — só VENDA liberada (compras bloqueadas)", icon="📉")
+            ui.banner(f"📉 {label}", "Só venda liberada, compras bloqueadas.", ui.SELL)
         else:
-            st.info(f"➖ {label} — sem bloqueio direcional", icon="➖")
+            ui.banner(f"➖ {label}", "Sem bloqueio direcional.", ui.MUTED)
 
     if mtf.blocked_reasons:
         st.warning("Filtros aplicados: " + " · ".join(mtf.blocked_reasons))
@@ -394,12 +406,9 @@ def render_flow_panel(context) -> None:
         return
 
     color = DIRECTION_COLOR[flow.bias]
-    st.markdown(
-        f'<div style="border:1px solid {color}; border-radius:8px; padding:10px 14px; '
-        f'background:{color}18; margin-bottom:10px;">'
-        f'<b style="color:{color}">{flow.label}</b> — força {flow.strength:.0f}/100'
-        f'{" · 🚨 VOLUME ANORMAL" if flow.spike else ""}'
-        f'</div>', unsafe_allow_html=True,
+    ui.banner(
+        f"{ui.esc(flow.label)} · força {flow.strength:.0f}/100",
+        "🚨 Volume anormal neste candle" if flow.spike else "", color,
     )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -411,7 +420,7 @@ def render_flow_panel(context) -> None:
     c4.metric("MFI (14)", f"{flow.mfi:.0f}", help="Money Flow Index — fluxo financeiro")
 
     for note in flow.notes:
-        st.caption(f"• {note}")
+        st.caption(f"• {note}".replace("$", "\\$"))  # "R$" não pode virar fórmula LaTeX
 
 
 def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
@@ -444,23 +453,17 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
         else:
             score_for_badge = next(s.score for s in result_a.signals if s.name == mtf.modality)
         star = "🌟 " if quality(score_for_badge) == "OPORTUNIDADE EXCEPCIONAL" else ""
-        st.markdown(
-            f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
-            f'background:{color}18; margin-bottom:14px;">'
-            f'{star}✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
-            f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>."
-            f"{agreement_note}"
-            f"</div>",
-            unsafe_allow_html=True,
+        ui.banner(
+            f"{star}✅ Confirmado: {mtf.confirmed_direction.value}",
+            f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>.{agreement_note}",
+            color,
         )
     else:
-        st.markdown(
-            f'<div style="border:1px solid #8291a1; border-radius:8px; padding:12px 16px; '
-            f'background:#8291a118; margin-bottom:14px;">'
-            f"❌ <b>NÃO CONFIRMADO</b> (leitura: <b>{mtf.modality}</b>) — {tf_a} diz <b>{dir_a.value}</b>, "
-            f"{tf_b} diz <b>{dir_b.value}</b>. Só é recomendação operável quando os dois concordam."
-            f"</div>",
-            unsafe_allow_html=True,
+        ui.banner(
+            f"Não confirmado · leitura {mtf.modality}",
+            f"{tf_a} diz <b>{dir_a.value}</b>, {tf_b} diz <b>{dir_b.value}</b>. "
+            "Só vira recomendação operável quando os dois concordam.",
+            ui.MUTED,
         )
 
 
@@ -515,13 +518,7 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
         )
 
         outcome_label, outcome_color = OUTCOME_LABELS[check.outcome]
-        st.markdown(
-            f'<div style="border:1px solid {outcome_color}; border-radius:8px; padding:12px 16px; '
-            f'background:{outcome_color}18; margin:10px 0;">'
-            f'<b style="color:{outcome_color}">{outcome_label}</b><br>{check.outcome_detail}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        ui.banner(outcome_label, ui.esc(check.outcome_detail), outcome_color)
 
         if check.outcome in ("EM_ABERTO", "STOP", "ALVO_1", "ALVO_2"):
             st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
@@ -576,7 +573,7 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
         with tab:
             render_signal_panel(s, symbol, risk_budget)
 
-    st.markdown("### Resumo — as 6 leituras lado a lado")
+    st.markdown("### As 6 leituras lado a lado")
     st.dataframe(
         [{
             "Análise": s.name, "Direção": s.direction.value, "Score": round(s.score, 1),
@@ -585,6 +582,7 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
             "Alvo 1": round(s.risk.target_1, 2) if s.risk.target_1 else None,
         } for s in signals],
         hide_index=True, use_container_width=True,
+        column_config={"Score": SCORE_COL},
     )
 
 
@@ -879,8 +877,7 @@ def _persist_watchlist() -> None:
 # Sidebar
 # ========================================================================
 with st.sidebar:
-    st.markdown("## 📊 Day Trade SMC")
-    st.caption("SMC · Price Action · Médias Móveis · VWAP")
+    ui.sidebar_brand()
 
     mode = st.radio(
         "Modo",
@@ -1069,31 +1066,45 @@ with st.sidebar:
 # ========================================================================
 # Corpo principal
 # ========================================================================
-st.title("📊 Day Trade SMC — Análise Técnica")
-st.warning(
-    "⚠️ **Dados do Yahoo Finance com atraso de ~15-20 minutos.** Use esta ferramenta para "
-    "**viés e estrutura** (tendência, níveis, força relativa entre ativos) — **nunca para o "
-    "preço/timing exato de execução.** Antes de entrar numa operação, confirme o preço real "
-    "no ProfitChart ou na tela da sua corretora.",
-    icon="⏱️",
+_MODE_SUB = {
+    "🔥 Oportunidades agora": "Só o que está operável agora, em toda a watchlist",
+    "Análise individual": f"{st.session_state.get('symbol_select', '')} · gráfico e as 6 leituras",
+    "Scanner (todos os ativos)": "Ranking da watchlist pelo score de confluência",
+    "Verificação retroativa": f"{st.session_state.get('symbol_select', '')} · o sinal de um dia passado e o que aconteceu depois",
+    "Mini Índice (WINFUT)": "Mini índice em M5 e M15",
+}
+_win_ok_hero, _win_note_hero = trading_window_status()
+_bias_hero = cached_market_bias(source)
+if _bias_hero.error:
+    _bias_chip = ("IBOV indisponível", ui.MUTED)
+else:
+    _bias_chip = (f"IBOV {_bias_hero.change_pct:+.2f}% · {_bias_hero.direction.value.lower()}",
+                  ui.tone_for(_bias_hero.direction.value))
+ui.hero(
+    "Day Trade SMC",
+    _MODE_SUB.get(mode, ""),
+    [
+        ("Janela aberta" if _win_ok_hero else "Fora da janela", ui.BUY if _win_ok_hero else ui.SELL),
+        _bias_chip,
+        ({"Yahoo Finance": "Yahoo · atraso", "MetaTrader 5": "MT5 · tempo real"}.get(source, "MT5 de casa"),
+         ui.GOLD if source == "Yahoo Finance" else ui.STEEL),
+    ],
+    delay_note=source == "Yahoo Finance",
 )
 
 if mode == "🔥 Oportunidades agora":
-    window_ok_now, window_note_now = trading_window_status()
-    bias_now = cached_market_bias(source)
+    window_ok_now, window_note_now = _win_ok_hero, _win_note_hero
+    bias_now = _bias_hero
 
-    col1, col2 = st.columns(2)
-    with col1:
-        (st.success if window_ok_now else st.error)(f"⏰ {window_note_now}")
-    with col2:
-        if bias_now.error:
-            st.info("➖ Viés do IBOV indisponível — nenhum bloqueio direcional")
-        elif bias_now.direction == Direction.BUY:
-            st.success(f"📈 {bias_now.label} ({bias_now.change_pct:+.2f}%) — só COMPRA liberada")
-        elif bias_now.direction == Direction.SELL:
-            st.error(f"📉 {bias_now.label} ({bias_now.change_pct:+.2f}%) — só VENDA liberada")
-        else:
-            st.info(f"➖ {bias_now.label} ({bias_now.change_pct:+.2f}%) — os dois lados liberados")
+    if bias_now.error:
+        _lado = "Viés do IBOV indisponível: nenhum bloqueio direcional."
+    elif bias_now.direction == Direction.BUY:
+        _lado = f"{bias_now.label}: só compra liberada."
+    elif bias_now.direction == Direction.SELL:
+        _lado = f"{bias_now.label}: só venda liberada."
+    else:
+        _lado = f"{bias_now.label}: os dois lados liberados."
+    ui.banner(f"⏰ {ui.esc(window_note_now)}", ui.esc(_lado), ui.BUY if window_ok_now else ui.SELL)
 
     if st.session_state.get("filter_window", True) and not window_ok_now:
         st.warning(
@@ -1128,22 +1139,28 @@ if mode == "🔥 Oportunidades agora":
             ativos = opp_df["Ativo"].nunique()
             compras = int((opp_df["Direção"] == "COMPRA").sum())
             vendas = int((opp_df["Direção"] == "VENDA").sum())
-            st.markdown(f"### {len(opp_df)} oportunidade(s) em {ativos} ativo(s) — "
-                        f"🟢 {compras} compra(s) · 🔴 {vendas} venda(s)")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Oportunidades", len(opp_df))
+            k2.metric("Ativos", ativos)
+            k3.metric("Compras", compras)
+            k4.metric("Vendas", vendas)
             if ran_at is not None:
                 st.caption(f"Varredura de {ran_at.strftime('%d/%m/%Y %H:%M:%S')} · corte {thr} pontos")
+            _sc = next(c for c in opp_df.columns if str(c).startswith("Score"))
+            ui.podium(_podium_rows(opp_df, _sc, ("Leitura", "Qualidade")))
 
             def _color_dir_opp(val):
                 if val == "COMPRA":
-                    return "color: #2ed3a3; font-weight: 600"
+                    return f"color: {ui.BUY}; font-weight: 600"
                 if val == "VENDA":
-                    return "color: #ff5470; font-weight: 600"
-                return "color: #8291a1"
+                    return f"color: {ui.SELL}; font-weight: 600"
+                return f"color: {ui.MUTED}"
 
             st.dataframe(
                 opp_df.style.map(_color_dir_opp, subset=["Direção"]),
                 hide_index=True, use_container_width=True,
                 height=min(600, 45 + 35 * len(opp_df)),
+                column_config=_score_cols(opp_df),
             )
 
             if not st.session_state.get("opp_risk_budget"):
@@ -1187,14 +1204,24 @@ elif mode == "Scanner (todos os ativos)":
 
         def _color_direction(val):
             if val == "COMPRA":
-                return "color: #2ed3a3; font-weight: 600"
+                return f"color: {ui.BUY}; font-weight: 600"
             if val == "VENDA":
-                return "color: #ff5470; font-weight: 600"
-            return "color: #8291a1"
+                return f"color: {ui.SELL}; font-weight: 600"
+            return f"color: {ui.MUTED}"
+
+        _conf = result_df[result_df["Confirmado"] == "✅"] if "Confirmado" in result_df.columns else result_df.iloc[0:0]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Ativos analisados", len(result_df))
+        k2.metric("Confirmados", len(_conf))
+        k3.metric("Compras", int((_conf["Direção"] == "COMPRA").sum()) if len(_conf) else 0)
+        k4.metric("Vendas", int((_conf["Direção"] == "VENDA").sum()) if len(_conf) else 0)
+        if "Score Geral" in result_df.columns:
+            ui.podium(_podium_rows(_conf, "Score Geral", ("Destaque", "Fluxo")))
 
         st.dataframe(
             result_df.style.map(_color_direction, subset=["Direção"]),
             hide_index=True, use_container_width=True, height=min(450, 45 + 35 * len(result_df)),
+            column_config=_score_cols(result_df),
         )
 
         st.markdown("#### Abrir análise completa de um ativo")
