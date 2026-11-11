@@ -26,6 +26,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import daytrade_smc
+import panorama
+import panorama_ui
 import ui_theme as ui
 from daytrade_smc import (
     ALL_MODALITIES_OPTION,
@@ -644,6 +646,12 @@ def _winfut_auto_refresh_300(modality, source, count, risk_budget):
     render_winfut_analysis(modality, source, count, risk_budget)
 
 
+@st.fragment(run_every=120)
+def _panorama_auto_120(render_fn):
+    cached_panorama_dados.clear()
+    render_fn()
+
+
 _WINFUT_AUTO_REFRESH_FRAGMENTS = {
     30: _winfut_auto_refresh_30,
     60: _winfut_auto_refresh_60,
@@ -873,18 +881,33 @@ def _persist_watchlist() -> None:
         pass  # ambiente somente-leitura — a lista continua funcionando na sessão
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_panorama_dados():
+    """Duas chamadas em lote ao Yahoo; 2 min de cache para não estourar o limite."""
+    return panorama.baixar()
+
+
+# ========================================================================
+# Navegação — os modos ficam numa barra horizontal no topo da página
+# ========================================================================
+PANORAMA_MODE = "🌎 Panorama de mercado"
+MODES = ["🔥 Oportunidades agora", PANORAMA_MODE, "Análise individual", "Scanner (todos os ativos)",
+         "Verificação retroativa", "Mini Índice (WINFUT)"]
+_MODE_LABEL = {
+    "🔥 Oportunidades agora": "🔥 Oportunidades", PANORAMA_MODE: "🌎 Panorama", "Análise individual": "📈 Análise",
+    "Scanner (todos os ativos)": "🔍 Scanner", "Verificação retroativa": "⏪ Retroativa", "Mini Índice (WINFUT)": "📊 Mini índice",
+}
+if st.session_state.get("mode_select") not in MODES:
+    st.session_state.mode_select = MODES[0]
+with st.container(key="topnav"):
+    mode = st.radio("Modo", MODES, key="mode_select", horizontal=True, label_visibility="collapsed",
+                    format_func=lambda m: _MODE_LABEL.get(m, m))
+
 # ========================================================================
 # Sidebar
 # ========================================================================
 with st.sidebar:
     ui.sidebar_brand()
-
-    mode = st.radio(
-        "Modo",
-        ["🔥 Oportunidades agora", "Análise individual", "Scanner (todos os ativos)",
-         "Verificação retroativa", "Mini Índice (WINFUT)"],
-        key="mode_select",
-    )
 
     st.markdown("### Fonte de dados")
     source = st.radio(
@@ -933,134 +956,141 @@ with st.sidebar:
                         "Pode levar mais tempo em alguns casos — tenta de novo em instantes."
                     )
 
-    if mode != "Mini Índice (WINFUT)":
-        st.markdown("### Estilo de operação")
-        style = st.radio(
-            "Estilo", list(STYLES.keys()), key="style_select", horizontal=True,
-            help="Day Trade confirma em M15+H1 (posições no mesmo dia). "
-                 "Swing Trade confirma em Diário+Semanal (posições de dias a semanas), com H4 como contexto de timing de entrada.",
-        )
-        conf_a, conf_b = STYLES[style]["confirmation"]
-        context_label = ", ".join(TIMEFRAME_LABELS[tf] for tf in STYLES[style]["context"])
-        count_label = STYLES[style]["count_label"]
+    if mode == PANORAMA_MODE:
+        st.markdown("### Panorama")
+        st.caption("Placar do contexto externo (EUA, dólar, juros, commodities, bolsas globais) que pesa sobre o Ibovespa e o WINFUT. Dados do Yahoo Finance, cache de 2 min.")
+        if st.button("🔄 Atualizar cotações", type="primary", use_container_width=True):
+            cached_panorama_dados.clear()
+        auto_refresh = st.checkbox("Atualizar sozinho a cada 2 min", key="pn_auto")
     else:
-        style = None
-        conf_a, conf_b = WINFUT_CONFIRMATION_TIMEFRAMES
-        context_label = ", ".join(TIMEFRAME_LABELS[tf] for tf in WINFUT_CONTEXT_TIMEFRAMES)
-        count_label = "Candles fechados (M5 e M15)"
-        st.caption(
-            "📈 **Analisando exclusivamente o Mini Índice (WINFUT)** — contrato futuro, não faz "
-            "parte da watchlist de ações. Yahoo Finance normalmente não tem esse ativo disponível "
-            "de forma confiável; use MetaTrader 5 ou GitHub (MT5 de casa) como fonte."
+        if mode != "Mini Índice (WINFUT)":
+            st.markdown("### Estilo de operação")
+            style = st.radio(
+                "Estilo", list(STYLES.keys()), key="style_select", horizontal=True,
+                help="Day Trade confirma em M15+H1 (posições no mesmo dia). "
+                     "Swing Trade confirma em Diário+Semanal (posições de dias a semanas), com H4 como contexto de timing de entrada.",
+            )
+            conf_a, conf_b = STYLES[style]["confirmation"]
+            context_label = ", ".join(TIMEFRAME_LABELS[tf] for tf in STYLES[style]["context"])
+            count_label = STYLES[style]["count_label"]
+        else:
+            style = None
+            conf_a, conf_b = WINFUT_CONFIRMATION_TIMEFRAMES
+            context_label = ", ".join(TIMEFRAME_LABELS[tf] for tf in WINFUT_CONTEXT_TIMEFRAMES)
+            count_label = "Candles fechados (M5 e M15)"
+            st.caption(
+                "📈 **Analisando exclusivamente o Mini Índice (WINFUT)** — contrato futuro, não faz "
+                "parte da watchlist de ações. Yahoo Finance normalmente não tem esse ativo disponível "
+                "de forma confiável; use MetaTrader 5 ou GitHub (MT5 de casa) como fonte."
+            )
+
+        st.markdown("### Modalidade")
+        modality = st.selectbox(
+            "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
+            help="Confluência combina as 4 categorias estruturais (SMC/Price Action/Médias/VWAP). "
+                 "IFR é uma leitura de exaustão independente, fora da Confluência. \"Todas as modalidades\" calcula um SCORE GERAL "
+                 "(média das 6 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
+                 "e ordenar o Scanner.",
         )
 
-    st.markdown("### Modalidade")
-    modality = st.selectbox(
-        "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
-        help="Confluência combina as 4 categorias estruturais (SMC/Price Action/Médias/VWAP). "
-             "IFR é uma leitura de exaustão independente, fora da Confluência. \"Todas as modalidades\" calcula um SCORE GERAL "
-             "(média das 6 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
-             "e ordenar o Scanner.",
-    )
-
-    if mode != "Mini Índice (WINFUT)":
-        st.markdown("### Ativos monitorados")
-        new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
-        if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
-            value = new_symbol.strip().upper().replace(" ", "")
-            if value not in st.session_state.watchlist:
-                st.session_state.watchlist.append(value)
-                _persist_watchlist()
-            st.rerun()
-
-        if mode in ("Análise individual", "Verificação retroativa"):
-            st.selectbox("Ativo para análise", st.session_state.watchlist, key="symbol_select")
-
-        remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
-        if st.button("Remover", use_container_width=True) and remove_symbol != "—":
-            st.session_state.watchlist = [s for s in st.session_state.watchlist if s != remove_symbol]
-            _persist_watchlist()
-            st.rerun()
-
-        col_a_btn, col_b_btn = st.columns(2)
-        with col_a_btn:
-            if st.button("Lista padrão", use_container_width=True,
-                         help=f"Restaura os {len(DEFAULT_SYMBOLS)} ativos monitorados"):
-                st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
-                _persist_watchlist()
+        if mode != "Mini Índice (WINFUT)":
+            st.markdown("### Ativos monitorados")
+            new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
+            if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
+                value = new_symbol.strip().upper().replace(" ", "")
+                if value not in st.session_state.watchlist:
+                    st.session_state.watchlist.append(value)
+                    _persist_watchlist()
                 st.rerun()
-        with col_b_btn:
-            if st.button("Lista antiga", use_container_width=True,
-                         help="Restaura a watchlist anterior (VALE3, PETR4, ...)"):
-                st.session_state.watchlist = LEGACY_SYMBOLS.copy()
+
+            if mode in ("Análise individual", "Verificação retroativa"):
+                st.selectbox("Ativo para análise", st.session_state.watchlist, key="symbol_select")
+
+            remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
+            if st.button("Remover", use_container_width=True) and remove_symbol != "—":
+                st.session_state.watchlist = [s for s in st.session_state.watchlist if s != remove_symbol]
                 _persist_watchlist()
                 st.rerun()
 
-    # ------------------------------------------------------------------
-    # Filtros operacionais (pontos 1 e 2)
-    # ------------------------------------------------------------------
-    st.markdown("### Filtros operacionais")
-    intraday_mode = (mode == "Mini Índice (WINFUT)") or style == "Day Trade"
+            col_a_btn, col_b_btn = st.columns(2)
+            with col_a_btn:
+                if st.button("Lista padrão", use_container_width=True,
+                             help=f"Restaura os {len(DEFAULT_SYMBOLS)} ativos monitorados"):
+                    st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
+                    _persist_watchlist()
+                    st.rerun()
+            with col_b_btn:
+                if st.button("Lista antiga", use_container_width=True,
+                             help="Restaura a watchlist anterior (VALE3, PETR4, ...)"):
+                    st.session_state.watchlist = LEGACY_SYMBOLS.copy()
+                    _persist_watchlist()
+                    st.rerun()
 
-    st.checkbox(
-        f"Só operar nas janelas {TRADING_WINDOWS_LABEL}",
-        value=intraday_mode, key="filter_window",
-        help="Fora dessas duas janelas os sinais são bloqueados (viram NEUTRO). "
-             "São os horários de maior volatilidade e assertividade do pregão. "
-             "Desmarque para estudar fora do horário ou para Swing Trade.",
-    )
-    window_ok, window_note = trading_window_status()
-    st.session_state["_window_ok"] = window_ok
-    st.caption(("🟢 " if window_ok else "🔴 ") + window_note)
+        # ------------------------------------------------------------------
+        # Filtros operacionais (pontos 1 e 2)
+        # ------------------------------------------------------------------
+        st.markdown("### Filtros operacionais")
+        intraday_mode = (mode == "Mini Índice (WINFUT)") or style == "Day Trade"
 
-    st.checkbox(
-        "Bloquear operações contra o IBOV", value=True, key="filter_bias",
-        help="IBOV caindo → não sugere COMPRA. IBOV subindo → não sugere VENDA.",
-    )
-    bias = cached_market_bias(source)
-    st.session_state["_bias_dir"] = bias.direction.value
-    st.session_state["_bias_label"] = bias.label
-    if bias.error:
-        st.caption(f"⚠️ Viés do índice indisponível ({bias.symbol}) — nenhum bloqueio aplicado.")
-    else:
-        icon = {"COMPRA": "📈", "VENDA": "📉", "NEUTRO": "➖"}[bias.direction.value]
-        st.caption(f"{icon} **{bias.label}** ({bias.change_pct:+.2f}% na sessão · força {bias.score:+.0f})")
+        st.checkbox(
+            f"Só operar nas janelas {TRADING_WINDOWS_LABEL}",
+            value=intraday_mode, key="filter_window",
+            help="Fora dessas duas janelas os sinais são bloqueados (viram NEUTRO). "
+                 "São os horários de maior volatilidade e assertividade do pregão. "
+                 "Desmarque para estudar fora do horário ou para Swing Trade.",
+        )
+        window_ok, window_note = trading_window_status()
+        st.session_state["_window_ok"] = window_ok
+        st.caption(("🟢 " if window_ok else "🔴 ") + window_note)
 
-    st.markdown("### Parâmetros")
-    st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "
-              f"(ver \"Filtro multi-timeframe\" no rodapé). "
-              f"{context_label} aparece como contexto adicional.")
-    count = st.slider(count_label, min_value=50, max_value=400, value=250, step=10)
-    risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
-    risk_budget = risk_budget if risk_budget > 0 else None
+        st.checkbox(
+            "Bloquear operações contra o IBOV", value=True, key="filter_bias",
+            help="IBOV caindo → não sugere COMPRA. IBOV subindo → não sugere VENDA.",
+        )
+        bias = cached_market_bias(source)
+        st.session_state["_bias_dir"] = bias.direction.value
+        st.session_state["_bias_label"] = bias.label
+        if bias.error:
+            st.caption(f"⚠️ Viés do índice indisponível ({bias.symbol}) — nenhum bloqueio aplicado.")
+        else:
+            icon = {"COMPRA": "📈", "VENDA": "📉", "NEUTRO": "➖"}[bias.direction.value]
+            st.caption(f"{icon} **{bias.label}** ({bias.change_pct:+.2f}% na sessão · força {bias.score:+.0f})")
 
-    if mode in ("Análise individual", "Mini Índice (WINFUT)"):
-        st.markdown("### Atualização")
-        auto_refresh = st.checkbox("Atualizar automaticamente")
-        refresh_interval = st.select_slider(
-            "Intervalo", options=[30, 60, 120, 300], value=60, format_func=lambda s: f"{s}s",
-            disabled=not auto_refresh,
-        )
-    elif mode == "Scanner (todos os ativos)":
-        run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
-    elif mode == "🔥 Oportunidades agora":
-        st.markdown("### Critério de oportunidade")
-        opp_threshold = st.slider(
-            "Score mínimo", min_value=60, max_value=95, value=75, step=5,
-            help="Mostra qualquer leitura (Confluência, SMC, Price Action, Médias, VWAP ou IFR) "
-                 "com score acima deste corte.",
-        )
-        st.caption(
-            "⚠️ As leituras isoladas (SMC, Price Action, Médias, VWAP, IFR) são limitadas a "
-            "**79 pontos** pelo próprio motor — só a Confluência passa disso. Com corte acima "
-            "de 79 a lista mostra **apenas Confluência**."
-        )
-        opp_require_conf = st.checkbox(
-            "Exigir a mesma direção nos dois timeframes", value=True,
-            help=f"A leitura precisa apontar a mesma direção em {conf_a} e {conf_b}. "
-                 "Desmarcar aumenta MUITO o número de resultados — e o de falsos positivos.",
-        )
-        run_opp_clicked = st.button("🔥 Buscar oportunidades", type="primary", use_container_width=True)
+        st.markdown("### Parâmetros")
+        st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "
+                  f"(ver \"Filtro multi-timeframe\" no rodapé). "
+                  f"{context_label} aparece como contexto adicional.")
+        count = st.slider(count_label, min_value=50, max_value=400, value=250, step=10)
+        risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
+        risk_budget = risk_budget if risk_budget > 0 else None
+
+        if mode in ("Análise individual", "Mini Índice (WINFUT)"):
+            st.markdown("### Atualização")
+            auto_refresh = st.checkbox("Atualizar automaticamente")
+            refresh_interval = st.select_slider(
+                "Intervalo", options=[30, 60, 120, 300], value=60, format_func=lambda s: f"{s}s",
+                disabled=not auto_refresh,
+            )
+        elif mode == "Scanner (todos os ativos)":
+            run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
+        elif mode == "🔥 Oportunidades agora":
+            st.markdown("### Critério de oportunidade")
+            opp_threshold = st.slider(
+                "Score mínimo", min_value=60, max_value=95, value=75, step=5,
+                help="Mostra qualquer leitura (Confluência, SMC, Price Action, Médias, VWAP ou IFR) "
+                     "com score acima deste corte.",
+            )
+            st.caption(
+                "⚠️ As leituras isoladas (SMC, Price Action, Médias, VWAP, IFR) são limitadas a "
+                "**79 pontos** pelo próprio motor — só a Confluência passa disso. Com corte acima "
+                "de 79 a lista mostra **apenas Confluência**."
+            )
+            opp_require_conf = st.checkbox(
+                "Exigir a mesma direção nos dois timeframes", value=True,
+                help=f"A leitura precisa apontar a mesma direção em {conf_a} e {conf_b}. "
+                     "Desmarcar aumenta MUITO o número de resultados — e o de falsos positivos.",
+            )
+            run_opp_clicked = st.button("🔥 Buscar oportunidades", type="primary", use_container_width=True)
 
 
 # ========================================================================
@@ -1068,6 +1098,7 @@ with st.sidebar:
 # ========================================================================
 _MODE_SUB = {
     "🔥 Oportunidades agora": "Só o que está operável agora, em toda a watchlist",
+    PANORAMA_MODE: "Contexto externo que pesa sobre o Ibovespa e o mini índice",
     "Análise individual": f"{st.session_state.get('symbol_select', '')} · gráfico e as 6 leituras",
     "Scanner (todos os ativos)": "Ranking da watchlist pelo score de confluência",
     "Verificação retroativa": f"{st.session_state.get('symbol_select', '')} · o sinal de um dia passado e o que aconteceu depois",
@@ -1177,6 +1208,21 @@ if mode == "🔥 Oportunidades agora":
         st.info("Clique em **🔥 Buscar oportunidades** na barra lateral. "
                 f"A varredura leva ~{max(1, len(st.session_state.watchlist) * 2 // 60)}-"
                 f"{max(2, len(st.session_state.watchlist) * 4 // 60)} min com {len(st.session_state.watchlist)} ativos no Yahoo Finance.")
+
+elif mode == PANORAMA_MODE:
+    def _render_panorama():
+        try:
+            diario, intra = cached_panorama_dados()
+        except Exception as exc:
+            st.error(f"Não foi possível buscar as cotações no Yahoo: {exc}. Tente de novo em alguns minutos.")
+            return
+        panorama_ui.render(panorama.montar(diario, intra))
+
+    if auto_refresh:
+        _panorama_auto_120(_render_panorama)
+    else:
+        with st.spinner("Buscando cotações..."):
+            _render_panorama()
 
 elif mode == "Análise individual":
     symbol = st.session_state.symbol_select

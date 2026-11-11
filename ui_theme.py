@@ -90,6 +90,25 @@ p, li, label, .stMarkdown {{ font-family: '{FONT_BODY}', sans-serif; }}
 }}
 [data-testid="stSidebar"] [role="radiogroup"] label[data-selected="true"] p,
 [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) p {{ color: var(--text); font-weight: 700; }}
+/* barra de navegação horizontal no topo (os modos) */
+.st-key-topnav {{ position: sticky; top: 0; z-index: 50; padding: 4px 0 10px; background: linear-gradient(180deg, var(--ink) 70%, transparent); }}
+.st-key-topnav [role="radiogroup"] {{
+  display:flex; flex-wrap: wrap; gap: 6px !important; padding: 6px; border-radius: 16px; width: fit-content; max-width: 100%;
+  background: rgba(0,0,0,.25); box-shadow: 0 2px 6px rgba(0,0,0,.45) inset;
+}}
+.st-key-topnav [role="radiogroup"] label {{
+  margin: 0 !important; padding: 8px 14px !important; border-radius: 11px; cursor: pointer;
+}}
+.st-key-topnav [data-testid="stRadioOption"] > div > div:not([data-testid]),
+.st-key-topnav [role="radiogroup"] label > div:first-child:not(:last-child) {{ display: none; }}
+.st-key-topnav [role="radiogroup"] label p {{ color: var(--muted); font-weight: 600; font-size: .9rem; }}
+.st-key-topnav [role="radiogroup"] label[data-selected="true"],
+.st-key-topnav [role="radiogroup"] label:has(input:checked) {{
+  background: linear-gradient(180deg, #2a4170, #1f3256); box-shadow: 0 1px 0 rgba(255,255,255,.12) inset, 0 3px 0 var(--edge), 0 8px 14px rgba(0,0,0,.4);
+}}
+.st-key-topnav [role="radiogroup"] label[data-selected="true"] p,
+.st-key-topnav [role="radiogroup"] label:has(input:checked) p {{ color: var(--text); }}
+.st-key-topnav label:focus-within {{ outline: 2px solid var(--steel); outline-offset: 2px; }}
 /* ------------------------------------------------ placas genéricas */
 .slab {{
   background: linear-gradient(180deg, var(--slab-up), var(--slab));
