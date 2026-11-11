@@ -26,9 +26,19 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import daytrade_smc
+import importlib
+
 import panorama
 import panorama_ui
 import ui_theme as ui
+
+# O Streamlit Cloud, ao receber um commit novo, reexecuta este arquivo mas pode
+# manter na memória a versão ANTIGA dos módulos importados (foi o que causou o
+# "AttributeError: panorama_ui.faixa"). Recarregar os três módulos visuais a
+# cada execução custa milissegundos e garante que o código novo seja usado.
+# O motor (daytrade_smc) não entra aqui para não perder a configuração da ponte GitHub.
+for _mod in (ui, panorama, panorama_ui):
+    importlib.reload(_mod)
 from daytrade_smc import (
     ALL_MODALITIES_OPTION,
     DATA_SOURCES,
