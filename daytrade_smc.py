@@ -71,13 +71,14 @@ LEGACY_SYMBOLS = [
 ]
 
 # ------------------------------------------------------------------
-# 1) Janela de operação — só analisa/valida sinais nos horários de
-#    maior volatilidade e assertividade do pregão brasileiro.
+# 1) Janela de operação — o pregão inteiro de day trade, da abertura
+#    às 17:55 (antes havia 10:00–11:30 e 13:35–16:00). Toda operação é
+#    zerada no mesmo dia: ZERAGEM_DAYTRADE é o horário-limite de saída.
 # ------------------------------------------------------------------
 TRADING_WINDOWS: tuple[tuple[dt_time, dt_time], ...] = (
-    (dt_time(10, 0), dt_time(11, 30)),
-    (dt_time(13, 35), dt_time(16, 0)),
+    (dt_time(10, 0), dt_time(17, 55)),
 )
+ZERAGEM_DAYTRADE = dt_time(17, 55)
 TRADING_WINDOWS_LABEL = " e ".join(
     f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}" for a, b in TRADING_WINDOWS
 )

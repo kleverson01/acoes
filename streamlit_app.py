@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -471,6 +472,8 @@ OUTCOME_LABELS = {
     "ALVO_2": ("✅ Bateu o Alvo 2", "#2ed3a3"),
     "STOP": ("❌ Bateu o Stop", "#ff5470"),
     "EM_ABERTO": ("⏳ Ainda em aberto", "#f0b429"),
+    "ZERADO_GANHO": ("🟢 Zerado no lucro (17:55)", "#2ed3a3"),
+    "ZERADO_PERDA": ("🔴 Zerado no prejuízo (17:55)", "#ff5470"),
     "SEM_SINAL": ("— Sem sinal operável nesta data", "#8291a1"),
     "SEM_DADO_FUTURO": ("⏳ Sem candles seguintes disponíveis ainda", "#8291a1"),
 }
@@ -482,7 +485,7 @@ def _cached_ohlcv(symbol: str, timeframe: str, count: int, source: str) -> pd.Da
 
 
 def retro_day(symbol: str, timeframe: str, day, modality: str, source: str, count: int,
-              score_min: float, use_window: bool) -> dict:
+              score_min: float, use_window: bool, excluir_reversao: bool = False, exigir_h1: bool = False) -> dict:
     """
     Repassa o pregão escolhido candle a candle, sem espiar o futuro: em cada
     fechamento roda o motor só com o que existia até ali. O primeiro sinal
@@ -505,6 +508,23 @@ def retro_day(symbol: str, timeframe: str, day, modality: str, source: str, coun
     if not idx_dia:
         return {**base, "Resultado": "SEM_DADO", "Detalhe": "Sem candles deste ativo na data."}
 
+    # Direção da Confluência no último candle de 60 min JÁ FECHADO (sem olhar o futuro).
+    h1_df = h1_local = None
+    h1_cache: dict[int, int] = {}
+    if exigir_h1 and timeframe != "H1":
+        h1_df = _cached_ohlcv(symbol, "H1", min(count + 8 * (dias_uteis + 1), 3000), source)
+        h1_local = h1_df.index.tz_convert("America/Sao_Paulo")
+
+    def _dir_h1(fech) -> int:
+        j = int(np.searchsorted(h1_local + pd.Timedelta(hours=1), fech, side="right")) - 1
+        if j < 30:
+            return 0
+        if j not in h1_cache:
+            _, sig_h1 = daytrade_smc.analyze(h1_df.iloc[max(0, j + 1 - count): j + 1])
+            conf_h1 = next(s for s in sig_h1 if s.name == "Confluência")
+            h1_cache[j] = {Direction.BUY: 1, Direction.SELL: -1}.get(conf_h1.direction, 0)
+        return h1_cache[j]
+
     sinais = 0
     primeiro = None
     for i in idx_dia:
@@ -526,6 +546,10 @@ def retro_day(symbol: str, timeframe: str, day, modality: str, source: str, coun
             direction, score, risk, setup = chosen.direction, chosen.score, chosen.risk, chosen.setup
         if direction == Direction.NEUTRAL or risk is None or risk.entry is None or score < score_min:
             continue
+        if excluir_reversao and str(setup).startswith("Reversão de tendência"):
+            continue
+        if h1_df is not None and _dir_h1(fechamento) != (1 if direction == Direction.BUY else -1):
+            continue
         sinais += 1
         if primeiro is None:
             primeiro = (i, fechamento, direction, score, risk, setup)
@@ -534,16 +558,41 @@ def retro_day(symbol: str, timeframe: str, day, modality: str, source: str, coun
         return {**base, "Resultado": "SEM_SINAL", "Detalhe": f"Nenhum sinal com score ≥ {score_min:.0f} no dia."}
 
     i, fechamento, direction, score, risk, setup = primeiro
-    outcome, detail, _ = daytrade_smc.evaluate_signal_outcome(risk, direction, df.iloc[i + 1:])
+    # Day trade: só valem os candles do MESMO pregão, até a zeragem das 17:55.
+    fut = df.iloc[i + 1:]
+    fut_local = fut.index.tz_convert("America/Sao_Paulo")
+    fut = fut[(fut_local.date == day) & ((fut_local + duration).time <= daytrade_smc.ZERAGEM_DAYTRADE)]
+    outcome, detail, _ = daytrade_smc.evaluate_signal_outcome(risk, direction, fut)
+    d = 1 if direction == Direction.BUY else -1
+    risco = abs(risk.entry - risk.stop) or float("nan")
+    if outcome == "STOP":
+        r_mult = -1.0
+    elif outcome == "ALVO_1":
+        r_mult = (risk.target_1 - risk.entry) * d / risco
+    elif outcome == "ALVO_2":
+        r_mult = (risk.target_2 - risk.entry) * d / risco
+    elif len(fut):
+        saida = float(fut["close"].iloc[-1])
+        r_mult = (saida - risk.entry) * d / risco
+        hoje_local = pd.Timestamp.now(tz="America/Sao_Paulo")
+        if day == hoje_local.date() and hoje_local.time() < daytrade_smc.ZERAGEM_DAYTRADE:
+            outcome, detail = "EM_ABERTO", f"Pregão em andamento; agora em R$ {saida:.2f} ({r_mult:+.2f} R)."
+        else:
+            outcome = "ZERADO_GANHO" if r_mult > 0 else "ZERADO_PERDA"
+            detail = f"Sem alvo nem stop no dia; zerado em R$ {saida:.2f} ({r_mult:+.2f} R)."
+    else:
+        r_mult = 0.0
     return {**base, "Sinais no dia": sinais, "Hora": fechamento.strftime("%H:%M"), "Direção": direction.value,
             "Score": round(score, 1), "Setup": setup, "Entrada": round(risk.entry, 2), "Stop": round(risk.stop, 2),
-            "Alvo 1": round(risk.target_1, 2) if risk.target_1 else None, "Resultado": outcome, "Detalhe": detail}
+            "Alvo 1": round(risk.target_1, 2) if risk.target_1 else None, "Resultado": outcome,
+            "R": round(r_mult, 2), "Detalhe": detail}
 
 
 def render_retro_all(style: str, modality: str, source: str, count: int) -> None:
     st.caption(
         "Repassa o pregão escolhido em todas as ações da watchlist, candle a candle, sem espiar o futuro. "
-        "Em cada ativo vale o primeiro sinal operável do dia, e depois confere se bateu alvo ou stop."
+        "Em cada ativo vale o primeiro sinal operável do dia. Como é day trade, a operação termina no alvo, "
+        "no stop ou zerada às 17:55 do mesmo pregão."
     )
     all_tfs = list(dict.fromkeys([*STYLES[style]["confirmation"], *STYLES[style]["context"]]))
     all_tfs = [tf for tf in all_tfs if tf not in ("D1", "W1")] or all_tfs
@@ -570,6 +619,15 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
     with c4:
         st.write("")
         run = st.button("⏪ Verificar o dia", type="primary", use_container_width=True)
+    f1, f2 = st.columns(2)
+    excluir_reversao = f1.checkbox(
+        "Ignorar reversão de tendência (CHoCH)", value=True, key="retro_sem_choch",
+        help="Em 88 pregões (jul–nov/2026), com zeragem às 17:55, a reversão foi o setup que mais perdeu. "
+             "Tirá-la reduziu a perda média tanto no período de estudo quanto no de validação.")
+    exigir_h1 = f2.checkbox(
+        "Exigir o gráfico de 60 min na mesma direção", value=True, key="retro_h1",
+        help="Só aceita o sinal se a Confluência do último candle de 60 min fechado aponta para o mesmo lado. "
+             "Foi o filtro que mais ajudou nos dois períodos.")
 
     if run:
         rows = []
@@ -579,7 +637,8 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
         for n, symbol in enumerate(symbols):
             prog.progress((n + 1) / len(symbols), text=f"Repassando {symbol} ({n + 1}/{len(symbols)})...")
             try:
-                rows.append(retro_day(symbol, check_tf, day, retro_mod, source, count, float(score_min), use_window))
+                rows.append(retro_day(symbol, check_tf, day, retro_mod, source, count, float(score_min), use_window,
+                                      excluir_reversao, exigir_h1))
             except Exception as exc:
                 rows.append({"Ativo": symbol, "Resultado": "ERRO", "Detalhe": str(exc)[:80]})
             if source != "MetaTrader 5":
@@ -595,16 +654,21 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
 
     df, r_day, r_tf, r_score, r_mod = st.session_state.retro_result
     labels = {k: v[0] for k, v in OUTCOME_LABELS.items()} | {"SEM_DADO": "— Sem candles na data", "ERRO": "⚠️ Erro"}
-    com_sinal = df[df["Resultado"].isin(["ALVO_1", "ALVO_2", "STOP", "EM_ABERTO"])]
-    ganhos = int(com_sinal["Resultado"].isin(["ALVO_1", "ALVO_2"]).sum())
+    com_sinal = df[df["Resultado"].isin(["ALVO_1", "ALVO_2", "STOP", "EM_ABERTO", "ZERADO_GANHO", "ZERADO_PERDA"])]
+    fechadas = com_sinal[com_sinal["Resultado"] != "EM_ABERTO"]
+    ganhos = int((fechadas["R"] > 0).sum()) if "R" in fechadas else 0
+    alvos = int(com_sinal["Resultado"].isin(["ALVO_1", "ALVO_2"]).sum())
     stops = int((com_sinal["Resultado"] == "STOP").sum())
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Ações verificadas", len(df))
-    k2.metric("Com sinal", len(com_sinal))
-    k3.metric("Bateram alvo", ganhos)
-    k4.metric("Bateram stop", stops)
-    k5.metric("Acerto", f"{ganhos / (ganhos + stops) * 100:.0f}%" if ganhos + stops else "—",
-              help="Alvos ÷ (alvos + stops). Operações em aberto não entram na conta.")
+    zerados = int(com_sinal["Resultado"].isin(["ZERADO_GANHO", "ZERADO_PERDA"]).sum())
+    total_r = float(fechadas["R"].sum()) if "R" in fechadas and len(fechadas) else 0.0
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Com sinal", len(com_sinal), help=f"De {len(df)} ações verificadas.")
+    k2.metric("Alvo", alvos)
+    k3.metric("Stop", stops)
+    k4.metric("Zeradas 17:55", zerados)
+    k5.metric("Acerto", f"{ganhos / len(fechadas) * 100:.0f}%" if len(fechadas) else "—",
+              help="Operações que terminaram no lucro (alvo ou zeragem positiva) ÷ operações encerradas no dia.")
+    k6.metric("Resultado", f"{total_r:+.1f} R", help="Soma em múltiplos do risco (1 R = distância entrada→stop), sem custos.")
     st.caption(f"Pregão {r_day.strftime('%d/%m/%Y')} · {TIMEFRAME_LABELS[r_tf]} · {r_mod} · score ≥ {r_score} · "
                f"filtro de janela {'ligado' if st.session_state.get('filter_window', True) else 'desligado'} · "
                "sem o filtro do IBOV (precisaria do índice de cada instante).")
@@ -614,13 +678,13 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
     else:
         view = com_sinal.sort_values("Score", ascending=False).copy()
         view["Resultado"] = view["Resultado"].map(labels)
-        cols = [c for c in ("Ativo", "Hora", "Direção", "Score", "Resultado", "Setup", "Entrada", "Stop", "Alvo 1",
+        cols = [c for c in ("Ativo", "Hora", "Direção", "Score", "Resultado", "R", "Setup", "Entrada", "Stop", "Alvo 1",
                             "Sinais no dia", "Detalhe") if c in view.columns]
 
         def _cor(val):
-            if isinstance(val, str) and val.startswith("✅"):
+            if isinstance(val, str) and val.startswith(("✅", "🟢")):
                 return f"color: {ui.BUY}; font-weight: 600"
-            if isinstance(val, str) and val.startswith("❌"):
+            if isinstance(val, str) and val.startswith(("❌", "🔴")):
                 return f"color: {ui.SELL}; font-weight: 600"
             if val == "COMPRA":
                 return f"color: {ui.BUY}"
@@ -630,8 +694,9 @@ def render_retro_all(style: str, modality: str, source: str, count: int) -> None
 
         st.dataframe(view[cols].style.map(_cor, subset=["Resultado", "Direção"]), hide_index=True,
                      use_container_width=True, height=min(600, 45 + 35 * len(view)),
-                     column_config={"Score": SCORE_COL, **{c: st.column_config.NumberColumn(c, format="%.2f")
-                                                           for c in ("Entrada", "Stop", "Alvo 1")}})
+                     column_config={"Score": SCORE_COL, "R": st.column_config.NumberColumn("R", format="%+.2f"),
+                                    **{c: st.column_config.NumberColumn(c, format="%.2f")
+                                       for c in ("Entrada", "Stop", "Alvo 1")}})
 
     sem = df[~df.index.isin(com_sinal.index)]
     if len(sem):
