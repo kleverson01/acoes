@@ -28,6 +28,7 @@ import streamlit as st
 import daytrade_smc
 import panorama
 import panorama_ui
+import mme200_ui
 import ui_theme as ui
 from daytrade_smc import (
     ALL_MODALITIES_OPTION,
@@ -1111,9 +1112,9 @@ def _faixa_panorama():
         st.markdown(panorama_ui.faixa(None), unsafe_allow_html=True)
 
 
-MODES = ["🔥 Oportunidades agora", "Análise individual", "Scanner (todos os ativos)", "Verificação retroativa"]
+MODES = ["🔥 Oportunidades agora", "🎯 Rejeição MME200", "Análise individual", "Scanner (todos os ativos)", "Verificação retroativa"]
 _MODE_LABEL = {
-    "🔥 Oportunidades agora": "🔥 Oportunidades", "Análise individual": "📈 Análise",
+    "🔥 Oportunidades agora": "🔥 Oportunidades", "🎯 Rejeição MME200": "🎯 MME200", "Análise individual": "📈 Análise",
     "Scanner (todos os ativos)": "🔍 Scanner", "Verificação retroativa": "⏪ Retroativa",
 }
 if st.session_state.get("mode_select") not in MODES:
@@ -1129,6 +1130,7 @@ with st.container(key="topnav"):
 # ========================================================================
 _MODE_SUB = {
     "🔥 Oportunidades agora": "Só o que está operável agora, em toda a watchlist",
+    "🎯 Rejeição MME200": "Toque na MME200 após impulso (M15) · alvo 0,5% · 10 mais líquidas",
     "Análise individual": "Gráfico e as 6 leituras de um ativo",
     "Scanner (todos os ativos)": "Ranking da watchlist pelo score geral (só score 30 ou mais)",
     "Verificação retroativa": "Um pregão passado, em todas as ações, e o que aconteceu depois",
@@ -1242,6 +1244,9 @@ if mode == "🔥 Oportunidades agora":
         st.info("Clique em **🔥 Buscar oportunidades**. "
                 f"A varredura leva ~{max(1, len(st.session_state.watchlist) * 2 // 60)}-"
                 f"{max(2, len(st.session_state.watchlist) * 4 // 60)} min com {len(st.session_state.watchlist)} ativos no Yahoo Finance.")
+
+elif mode == "🎯 Rejeição MME200":
+    mme200_ui.render(source, st.session_state.watchlist)
 
 elif mode == "Análise individual":
     if st.session_state.get("symbol_select") not in st.session_state.watchlist:
